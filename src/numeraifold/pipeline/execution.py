@@ -20,8 +20,8 @@ import pyarrow.parquet as pq
 
 # Sklearn
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import IncrementalPCA
-from sklearn.cluster import MiniBatchKMeans
+from sklearn.decomposition import PCA, IncrementalPCA
+from sklearn.cluster import KMeans, MiniBatchKMeans
 
 # Configuration and seed settings
 from numeraifold.config import RANDOM_SEED
@@ -546,35 +546,7 @@ def run_domains_only_pipeline(
     skip_visualizations: bool = False,
     random_seed: int = 42
 ) -> Dict:
-    """
-    Runs the pipeline for processing feature domains from the dataset.
-
-    This function loads data, processes it in chunks (with optional incremental learning),
-    applies dimensionality reduction and clustering to group features into domains, saves the
-    resulting domain information, and optionally generates visualizations.
-
-    Parameters:
-        data_version (str): Version of the dataset to use.
-        feature_set (str): Size of the feature set; options include 'small', 'medium', or 'all'.
-        main_target (str): Primary target column name.
-        num_aux_targets (int): Number of auxiliary targets to include if aux_targets is not provided.
-        aux_targets (Optional[List[str]]): List of specific auxiliary target names to use. Overrides num_aux_targets if provided.
-        sample_size (Optional[int]): Number of rows to sample from training data (None means use the full dataset).
-        n_clusters (Optional[int]): Number of clusters for domain grouping (None triggers auto-calculation).
-        save_path (str): File path to save the domain data CSV.
-        chunk_size (int): Number of rows to process per chunk.
-        use_incremental (bool): Flag to use incremental learning methods.
-        skip_visualizations (bool): If True, skips generation of visualizations.
-        random_seed (int): Random seed for reproducibility.
-
-    Returns:
-        Dict: Dictionary containing:
-            - 'feature_groups': Mapping of domain names to lists of features.
-            - 'num_domains': Total number of domains created.
-            - 'targets_used': List of target columns used.
-            - Additional keys for file paths of saved visualizations and any error messages.
-    """
-    # Start of pipeline execution
+    
     print(f"Starting optimized domain pipeline with {feature_set} feature set")
     log_memory_usage("Initial")
     
@@ -616,159 +588,89 @@ def run_domains_only_pipeline(
             print(f"Sampling {sample_size} rows from training data")
             train_df = train_df.sample(n=sample_size, random_state=random_seed)
         
-        # Initialize models
-        n_components = 50
-        if use_incremental:
-            print(f"Initializing incremental models with {n_components} components")
-            ipca = IncrementalPCA(n_components=n_components, batch_size=chunk_size)
-            if n_clusters is None:
-                n_clusters = min(20, len(features) // 3)
-            print(f"Using {n_clusters} clusters")
-            clusterer = MiniBatchKMeans(
-                n_clusters=n_clusters,
-                random_state=random_seed,
-                batch_size=chunk_size
-            )
-        else:
-            pca = IncrementalPCA(n_components=n_components, batch_size=chunk_size)
+        # Compute feature-target correlations to create feature embeddings
+        print("Computing feature-target correlations...")
+        correlations = []
+        for feature in features:
+            feature_corrs = []
+            for target in all_targets:
+                # Handle NaN values by filling with 0
+                feature_data = train_df[feature].fillna(0).values
+                target_data = train_df[target].fillna(0).values
+                corr = np.corrcoef(feature_data, target_data)[0, 1]
+                feature_corrs.append(corr)
+            correlations.append(feature_corrs)
+        correlations = np.array(correlations)
+        print(f"Correlation matrix shape: {correlations.shape}")
         
-        # Process data in chunks
-        feature_matrices = []
-        chunks_processed = 0
-        total_rows = 0
-        last_chunk = None
+        # Apply PCA on feature correlations to reduce dimensions
+        n_components = min(10, len(all_targets))
+        print(f"Applying PCA with {n_components} components on feature correlations...")
+        pca = PCA(n_components=n_components)
+        feature_embeddings = pca.fit_transform(correlations)
+        print(f"Feature embeddings shape: {feature_embeddings.shape}")
         
-        # Split training data into chunks
-        num_chunks = max(1, len(train_df) // chunk_size)
-        chunk_indices = np.array_split(train_df.index, num_chunks)
+        # Determine number of clusters if not provided
+        if n_clusters is None:
+            n_clusters = min(20, len(features) // 3)
+        print(f"Clustering features into {n_clusters} domains...")
         
-        print(f"Processing {len(chunk_indices)} chunks...")
+        # Cluster features using KMeans
+        clusterer = KMeans(n_clusters=n_clusters, random_state=random_seed)
+        cluster_labels = clusterer.fit_predict(feature_embeddings)
         
-        for chunk_idx in chunk_indices:
-            chunk = train_df.loc[chunk_idx]
-            
-            # Standardize features
-            chunk_features = chunk[features].fillna(0).values
-            scaler = StandardScaler()
-            chunk_features = scaler.fit_transform(chunk_features)
-            
-            if use_incremental:
-                # Update incremental models with the current chunk
-                ipca.partial_fit(chunk_features)
-                # Transform chunk with current PCA state and update clusterer
-                transformed_chunk = ipca.transform(chunk_features)
-                clusterer.partial_fit(transformed_chunk)
-                last_chunk = chunk_features  # Save original for final transform
-            else:
-                feature_matrices.append(chunk_features)
-            
-            chunks_processed += 1
-            total_rows += len(chunk)
-            
-            if chunks_processed % 10 == 0:
-                log_memory_usage(f"After chunk {chunks_processed}")
+        # Create feature groups based on feature-level clustering
+        from collections import defaultdict
+        feature_groups = defaultdict(list)
+        for idx, label in enumerate(cluster_labels):
+            domain_name = f"domain_{label}"
+            feature_groups[domain_name].append(features[idx])
         
-        print(f"Processed {chunks_processed} chunks, total {total_rows} rows")
-        
-        # Get final embeddings and cluster labels
-        if use_incremental:
-            if last_chunk is None:
-                raise ValueError("No data chunks were processed")
-            print("Generating final embedding using incremental PCA...")
-            final_embedding = ipca.transform(last_chunk)
-            print(f"Final embedding shape: {final_embedding.shape}")
-            print("Predicting cluster labels...")
-            cluster_labels = clusterer.predict(final_embedding)
-        else:
-            print("Processing batch PCA...")
-            combined_features = np.vstack(feature_matrices)
-            final_embedding = pca.fit_transform(combined_features)
-            
-            print("Applying UMAP...")
-            reducer = umap.UMAP(
-                n_neighbors=min(15, len(features) - 1),
-                min_dist=0.1,
-                n_components=2,
-                random_state=random_seed
-            )
-            final_embedding = reducer.fit_transform(final_embedding)
-            
-            if n_clusters is None:
-                n_clusters = min(20, len(features) // 3)
-            print(f"Clustering with {n_clusters} clusters...")
-            clusterer = MiniBatchKMeans(
-                n_clusters=n_clusters,
-                random_state=random_seed,
-                batch_size=chunk_size
-            )
-            cluster_labels = clusterer.fit_predict(final_embedding)
-        
-        # Create feature groups
-        print("Creating feature groups...")
-        feature_groups = {}
-        n_clusters = len(np.unique(cluster_labels))
-        for cluster_id in range(n_clusters):
-            indices = np.where(cluster_labels == cluster_id)[0]
-            domain_name = f"domain_{cluster_id}"
-            feature_groups[domain_name] = [features[i] for i in indices]
+        # Convert defaultdict to dict
+        feature_groups = dict(feature_groups)
         
         # Save results
         results['feature_groups'] = feature_groups
         results['num_domains'] = len(feature_groups)
         results['targets_used'] = all_targets
         
-        # Save domain data
+        # Save domain data to CSV
         try:
             print("Saving domain data...")
             domain_data = []
-            for feature_idx, feature in enumerate(features):
+            for idx, feature in enumerate(features):
                 domain_data.append({
                     'feature': feature,
-                    'domain_id': int(cluster_labels[feature_idx]),
-                    'domain_name': f"domain_{int(cluster_labels[feature_idx])}",
-                    'dimension_1': final_embedding[feature_idx, 0],
-                    'dimension_2': final_embedding[feature_idx, 1] if final_embedding.shape[1] > 1 else np.nan
+                    'domain_id': int(cluster_labels[idx]),
+                    'domain_name': f"domain_{int(cluster_labels[idx])}",
+                    **{f'dimension_{i+1}': emb for i, emb in enumerate(feature_embeddings[idx])}
                 })
-            
             domains_df = pd.DataFrame(domain_data)
             domains_df.to_csv(save_path, index=False)
             results['domains_saved_path'] = save_path
             print(f"Domain data saved to: {save_path}")
-            
         except Exception as save_error:
             print(f"Error saving domain data: {save_error}")
             results['save_error'] = str(save_error)
         
-        # Generate visualizations if requested
+        # Generate visualizations if not skipped
         if not skip_visualizations:
             try:
                 print("Generating visualizations...")
-                from numeraifold.domains.visualization import (
-                    visualize_feature_domains,
-                    visualize_domain_heatmap,
-                    create_interactive_domain_visualization
-                )
+                # Example visualization using UMAP on feature embeddings
+                reducer = umap.UMAP(random_state=random_seed)
+                vis_embeddings = reducer.fit_transform(feature_embeddings)
                 
-                base_path = save_path.replace('.csv', '')
-                plot_path = f"{base_path}_plot.png"
-                visualize_feature_domains(
-                    final_embedding,
-                    cluster_labels,
-                    features,
-                    max_features=100
-                ).savefig(plot_path, dpi=300, bbox_inches='tight')
+                plt.figure(figsize=(10, 8))
+                scatter = plt.scatter(vis_embeddings[:,0], vis_embeddings[:,1], c=cluster_labels, cmap='tab20', s=10)
+                plt.colorbar(scatter)
+                plt.title("Feature Domains Visualization")
+                
+                plot_path = save_path.replace('.csv', '_plot.png')
+                plt.savefig(plot_path, dpi=120, bbox_inches='tight')
+                plt.close()
                 results['plot_path'] = plot_path
-                
-                heatmap_path = f"{base_path}_heatmap.png"
-                visualize_domain_heatmap(
-                    final_embedding,
-                    cluster_labels,
-                    features,
-                    save_path=heatmap_path
-                )
-                results['heatmap_path'] = heatmap_path
-                print("Visualizations generated successfully")
-                
+                print("Visualization generated successfully")
             except Exception as viz_error:
                 print(f"Error generating visualizations: {viz_error}")
                 results['visualization_error'] = str(viz_error)
