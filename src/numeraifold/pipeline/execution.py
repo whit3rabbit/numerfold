@@ -581,7 +581,7 @@ def run_domains_only_pipeline(
     results = {}
     
     try:
-        # Load data with proper target handling
+        # Load data
         print("Loading data...")
         if aux_targets is not None:
             print(f"Using specified auxiliary targets: {aux_targets}")
@@ -589,10 +589,8 @@ def run_domains_only_pipeline(
                 data_version=data_version,
                 feature_set=feature_set,
                 main_target=main_target,
-                num_aux_targets=0  # When aux_targets provided, don't auto-select additional targets
+                num_aux_targets=0
             )
-            
-            # Verify that all specified auxiliary targets exist in the data
             missing_targets = [t for t in aux_targets if t not in train_df.columns]
             if missing_targets:
                 raise ValueError(f"Specified auxiliary targets not found in data: {missing_targets}")
@@ -618,32 +616,38 @@ def run_domains_only_pipeline(
             print(f"Sampling {sample_size} rows from training data")
             train_df = train_df.sample(n=sample_size, random_state=random_seed)
         
-        # Set up incremental learning models if enabled
+        # Initialize models
+        n_components = 50
         if use_incremental:
-            n_components = 50
+            print(f"Initializing incremental models with {n_components} components")
             ipca = IncrementalPCA(n_components=n_components, batch_size=chunk_size)
+            if n_clusters is None:
+                n_clusters = min(20, len(features) // 3)
+            print(f"Using {n_clusters} clusters")
             clusterer = MiniBatchKMeans(
-                n_clusters=n_clusters if n_clusters is not None else 20,
+                n_clusters=n_clusters,
                 random_state=random_seed,
                 batch_size=chunk_size
             )
+        else:
+            pca = IncrementalPCA(n_components=n_components, batch_size=chunk_size)
         
-        # Process data in chunks for scalability
+        # Process data in chunks
         feature_matrices = []
         chunks_processed = 0
         total_rows = 0
+        last_chunk = None
         
-        # Divide training data indices into chunks
+        # Split training data into chunks
         num_chunks = max(1, len(train_df) // chunk_size)
         chunk_indices = np.array_split(train_df.index, num_chunks)
         
         print(f"Processing {len(chunk_indices)} chunks...")
-        last_chunk = None  # To store the most recent processed chunk
         
         for chunk_idx in chunk_indices:
             chunk = train_df.loc[chunk_idx]
             
-            # Standardize features: fill missing values and apply scaling
+            # Standardize features
             chunk_features = chunk[features].fillna(0).values
             scaler = StandardScaler()
             chunk_features = scaler.fit_transform(chunk_features)
@@ -651,47 +655,47 @@ def run_domains_only_pipeline(
             if use_incremental:
                 # Update incremental models with the current chunk
                 ipca.partial_fit(chunk_features)
-                clusterer.partial_fit(chunk_features)
-                last_chunk = chunk_features  # Save the latest chunk for final transformation
+                # Transform chunk with current PCA state and update clusterer
+                transformed_chunk = ipca.transform(chunk_features)
+                clusterer.partial_fit(transformed_chunk)
+                last_chunk = chunk_features  # Save original for final transform
             else:
-                # Store chunk features for batch processing later
                 feature_matrices.append(chunk_features)
             
             chunks_processed += 1
             total_rows += len(chunk)
             
-            # Log memory usage every 10 chunks for monitoring purposes
             if chunks_processed % 10 == 0:
                 log_memory_usage(f"After chunk {chunks_processed}")
         
         print(f"Processed {chunks_processed} chunks, total {total_rows} rows")
         
-        # Dimensionality reduction and clustering
+        # Get final embeddings and cluster labels
         if use_incremental:
             if last_chunk is None:
                 raise ValueError("No data chunks were processed")
-            # Transform the last chunk to obtain the final embedding
+            print("Generating final embedding using incremental PCA...")
             final_embedding = ipca.transform(last_chunk)
+            print(f"Final embedding shape: {final_embedding.shape}")
+            print("Predicting cluster labels...")
             cluster_labels = clusterer.predict(final_embedding)
         else:
-            # For non-incremental, combine all chunks and apply PCA and UMAP
+            print("Processing batch PCA...")
             combined_features = np.vstack(feature_matrices)
-            pca = IncrementalPCA(n_components=50, batch_size=chunk_size)
-            pca_result = pca.fit_transform(combined_features)
+            final_embedding = pca.fit_transform(combined_features)
             
-            # Apply UMAP for further dimensionality reduction
+            print("Applying UMAP...")
             reducer = umap.UMAP(
                 n_neighbors=min(15, len(features) - 1),
                 min_dist=0.1,
                 n_components=2,
                 random_state=random_seed
             )
-            final_embedding = reducer.fit_transform(pca_result)
+            final_embedding = reducer.fit_transform(final_embedding)
             
-            # Determine number of clusters if not specified
             if n_clusters is None:
                 n_clusters = min(20, len(features) // 3)
-            
+            print(f"Clustering with {n_clusters} clusters...")
             clusterer = MiniBatchKMeans(
                 n_clusters=n_clusters,
                 random_state=random_seed,
@@ -699,21 +703,23 @@ def run_domains_only_pipeline(
             )
             cluster_labels = clusterer.fit_predict(final_embedding)
         
-        # Group features by cluster to define domains
+        # Create feature groups
+        print("Creating feature groups...")
         feature_groups = {}
-        unique_clusters = np.unique(cluster_labels)
-        for cluster_id in unique_clusters:
+        n_clusters = len(np.unique(cluster_labels))
+        for cluster_id in range(n_clusters):
             indices = np.where(cluster_labels == cluster_id)[0]
             domain_name = f"domain_{cluster_id}"
             feature_groups[domain_name] = [features[i] for i in indices]
         
-        # Record results
+        # Save results
         results['feature_groups'] = feature_groups
         results['num_domains'] = len(feature_groups)
         results['targets_used'] = all_targets
         
-        # Save domain data to CSV
+        # Save domain data
         try:
+            print("Saving domain data...")
             domain_data = []
             for feature_idx, feature in enumerate(features):
                 domain_data.append({
@@ -727,21 +733,22 @@ def run_domains_only_pipeline(
             domains_df = pd.DataFrame(domain_data)
             domains_df.to_csv(save_path, index=False)
             results['domains_saved_path'] = save_path
+            print(f"Domain data saved to: {save_path}")
             
         except Exception as save_error:
             print(f"Error saving domain data: {save_error}")
             results['save_error'] = str(save_error)
         
-        # Generate visualizations if not skipped
+        # Generate visualizations if requested
         if not skip_visualizations:
             try:
+                print("Generating visualizations...")
                 from numeraifold.domains.visualization import (
                     visualize_feature_domains,
                     visualize_domain_heatmap,
                     create_interactive_domain_visualization
                 )
                 
-                # Create and save a scatter plot of feature domains
                 base_path = save_path.replace('.csv', '')
                 plot_path = f"{base_path}_plot.png"
                 visualize_feature_domains(
@@ -752,7 +759,6 @@ def run_domains_only_pipeline(
                 ).savefig(plot_path, dpi=300, bbox_inches='tight')
                 results['plot_path'] = plot_path
                 
-                # Create and save a heatmap visualization
                 heatmap_path = f"{base_path}_heatmap.png"
                 visualize_domain_heatmap(
                     final_embedding,
@@ -761,6 +767,7 @@ def run_domains_only_pipeline(
                     save_path=heatmap_path
                 )
                 results['heatmap_path'] = heatmap_path
+                print("Visualizations generated successfully")
                 
             except Exception as viz_error:
                 print(f"Error generating visualizations: {viz_error}")
