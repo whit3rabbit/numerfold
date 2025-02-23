@@ -1,9 +1,6 @@
-import pandas as pd
 import numpy as np
-import functools
 
-# Import the domain analysis function from the artifacts module.
-from artifacts import load_and_analyze_domains
+from numeraifold.utils.artifacts import load_and_analyze_domains
 
 
 def integrate_domain_data_to_pipeline(run_alphafold_pipeline, domains_csv_path='feature_domains_data.csv'):

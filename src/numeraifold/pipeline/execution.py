@@ -23,14 +23,13 @@ from numeraifold.core.training import train_numeraifold_model
 from numeraifold.core.evaluation import run_final_evaluation, print_evaluation_results
 
 # Domain identification, visualization, and analysis
-from numeraifold.domains.identification import identify_feature_domains
+from numeraifold.domains.identification import identify_feature_domains, create_sequence_representation
 from numeraifold.domains.visualization import visualize_feature_domains, visualize_domain_heatmap, create_interactive_domain_visualization
 from numeraifold.domains.analysis import create_evolutionary_profiles, analyze_domain_relationships
 
 # Feature engineering and stability analysis
 from numeraifold.features.engineering import generate_alphafold_features
 from numeraifold.features.stability import calculate_feature_stability
-from numeraifold.features.sequences import create_sequence_representation
 
 # Utilities for saving/loading artifacts
 from numeraifold.utils.artifacts import save_model_artifacts, save_feature_domains_data, load_and_analyze_domains
