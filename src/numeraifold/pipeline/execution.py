@@ -75,7 +75,7 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
         dict: Results dictionary containing domain data, trained model, evaluation metrics, etc.
     """
     print("Starting AlphaFold-inspired Numerai pipeline...")
-    
+
     # Set random seed for reproducibility
     np.random.seed(random_seed)
     torch.manual_seed(random_seed)
@@ -458,36 +458,66 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
     return results
 
 
-def run_domains_only_pipeline():
+def run_domains_only_pipeline(
+    data_version="v5.0",
+    feature_set="small",
+    sample_size=None,
+    n_clusters=None,
+    save_path='feature_domains_data.csv',
+    main_target="target",
+    num_aux_targets=5
+):
     """
     Run just the domain extraction part of the pipeline.
-
     This function loads data, extracts feature domains, and saves both basic and detailed domain information.
     
+    Parameters:
+        data_version (str, optional): Identifier for the data version/folder. Defaults to "v5.0".
+        feature_set (str, optional): Size of feature set to use ('small', 'medium', 'all'). Defaults to "small".
+        sample_size (int, optional): Number of rows to sample for domain extraction. If None, uses full dataset.
+            Set to a smaller number (e.g., 50000) for faster processing. Defaults to None.
+        n_clusters (int, optional): Number of clusters for domain extraction. If None, defaults to
+            min(15, len(features) // 3). Defaults to None.
+        save_path (str, optional): Path to save the feature domains data. Defaults to 'feature_domains_data.csv'.
+        main_target (str, optional): The primary target column name. Defaults to "target".
+        num_aux_targets (int, optional): Number of auxiliary target columns to include. Defaults to 5.
+    
     Returns:
-        dict: Results dictionary containing domain information and paths to saved artifacts.
+        dict: Results dictionary containing:
+            - domain information
+            - paths to saved artifacts
+            - error information if any occurred
     """
     try:
         print("Loading data...")
-        # Note: Replace load_data with the proper import or implementation if available.
-        train_df, val_df, features, targets = load_data()
+        train_df, val_df, features, targets = load_data(
+            data_version=data_version,
+            feature_set=feature_set,
+            main_target=main_target,
+            num_aux_targets=num_aux_targets
+        )
+        
         if train_df is None:
             print("Failed to load data. Exiting.")
             return None
-
-        # Use a subset of data for faster processing if dataset is large
-        if len(train_df) > 50000:
+            
+        # Sample data if requested and if dataset is large enough
+        if sample_size is not None and len(train_df) > sample_size:
             print(f"Using a subset of data for faster domain extraction (original size: {len(train_df)})")
-            train_df = train_df.sample(50000, random_state=42)
-
+            train_df = train_df.sample(sample_size, random_state=42)
+            
+        # Calculate default number of clusters if not specified
+        if n_clusters is None:
+            n_clusters = min(15, len(features) // 3)
+            
         # Extract domains using the dedicated function
         results = extract_feature_domains_only(
             train_df,
             features,
-            n_clusters=min(15, len(features) // 3),
-            save_path='feature_domains_data.csv'
+            n_clusters=n_clusters,
+            save_path=save_path
         )
-
+        
         # Save feature list for reference
         try:
             feature_info = pd.DataFrame({'feature_name': features})
@@ -495,9 +525,10 @@ def run_domains_only_pipeline():
             print("Feature list saved to feature_list.csv")
         except Exception as feat_error:
             print(f"Error saving feature list: {feat_error}")
-
+            results['feature_list_error'] = str(feat_error)
+            
         return results
-
+        
     except Exception as e:
         print(f"Error running domains-only pipeline: {e}")
         traceback.print_exc()
