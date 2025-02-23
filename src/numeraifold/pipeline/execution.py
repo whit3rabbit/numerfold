@@ -470,17 +470,55 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
     print("AlphaFold-inspired pipeline completed")
     return results
 
-def chunked_data_loader(data_version: str, feature_set: str, chunk_size: int = 10000):
-    """Generator to load data in chunks."""
+def chunked_data_loader(
+    data_version: str,
+    feature_set: str,
+    chunk_size: int = 10000,
+    target_params: Optional[Dict] = None
+):
+    """
+    Generator to load data in chunks.
+    
+    Args:
+        data_version: Version of dataset
+        feature_set: Size of feature set
+        chunk_size: Size of chunks to load
+        target_params: Dictionary containing target configuration:
+            - main_target: Primary target column
+            - num_aux_targets: Number of auxiliary targets
+    """
+    if target_params is None:
+        target_params = {
+            'main_target': 'target',
+            'num_aux_targets': 3
+        }
+    import pyarrow.parquet as pq
     
     file_path = f"{data_version}/train.parquet"
     
     # Read schema and feature metadata
     schema = pq.read_schema(file_path)
+    all_columns = schema.names
+    
+    # Get features
     with open(f"{data_version}/features.json") as f:
         import json
         feature_metadata = json.load(f)
     features = feature_metadata["feature_sets"][feature_set]
+    
+    # Get targets
+    available_targets = [col for col in all_columns if col.startswith('target')]
+    if main_target not in available_targets:
+        print(f"Warning: {main_target} not found in dataset. Using first available target.")
+        main_target = available_targets[0] if available_targets else None
+    
+    main_target = target_params.get('main_target', main_target)
+    num_aux_targets = target_params.get('num_aux_targets', 3)
+    aux_targets = [t for t in available_targets if t != main_target][:num_aux_targets]
+    all_targets = [main_target] + aux_targets if main_target else aux_targets
+    
+    if not all_targets:
+        print("Warning: No target columns found.")
     
     # Create ParquetFile object
     parquet_file = pq.ParquetFile(file_path)
@@ -489,11 +527,11 @@ def chunked_data_loader(data_version: str, feature_set: str, chunk_size: int = 1
     for i in range(0, parquet_file.metadata.num_rows, chunk_size):
         chunk = pd.read_parquet(
             file_path,
-            columns=["era"] + features,
+            columns=["era"] + features + all_targets,
             skip_rows=i,
             num_rows=min(chunk_size, parquet_file.metadata.num_rows - i)
         )
-        yield chunk, features
+        yield chunk, features, all_targets
 
 def run_domains_only_pipeline(
     data_version: str = "v5.0",
@@ -514,6 +552,8 @@ def run_domains_only_pipeline(
     Args:
         data_version: Version of dataset to use
         feature_set: Size of feature set ('small', 'medium', 'all')
+        main_target: Primary target column name
+        num_aux_targets: Number of auxiliary targets to include
         sample_size: Number of rows to sample (None for full dataset)
         n_clusters: Number of clusters (None for auto-calculation)
         save_path: Path to save domain data
@@ -531,6 +571,21 @@ def run_domains_only_pipeline(
     results = {}
     
     try:
+        # Load data using the load_data function
+        print("Loading data...")
+        train_df, val_df, features, targets = load_data(
+            data_version=data_version,
+            feature_set=feature_set,
+            main_target=main_target,
+            num_aux_targets=num_aux_targets
+        )
+        
+        if train_df is None or val_df is None:
+            raise ValueError("Failed to load data")
+            
+        print(f"Loaded data with {len(features)} features and {len(targets)} targets")
+        print(f"Train shape: {train_df.shape}, Val shape: {val_df.shape}")
+        
         # Initialize incremental learning models if specified
         if use_incremental:
             n_components = 50  # Reduced from typical 100+ to save memory
@@ -543,20 +598,16 @@ def run_domains_only_pipeline(
         
         # Process data in chunks
         feature_matrices = []
-        all_features = None
         chunks_processed = 0
         total_rows = 0
         
-        print("Processing data chunks...")
-        for chunk, features, targets in chunked_data_loader(
-            data_version, 
-            feature_set, 
-            main_target=main_target,
-            num_aux_targets=num_aux_targets,
-            chunk_size=chunk_size
-        ):
-            if all_features is None:
-                all_features = features
+        # Split training data into chunks
+        num_chunks = max(1, len(train_df) // chunk_size)
+        chunk_indices = np.array_split(train_df.index, num_chunks)
+        
+        print(f"Processing {len(chunk_indices)} chunks...")
+        for chunk_idx in chunk_indices:
+            chunk = train_df.loc[chunk_idx]
             
             # Apply sampling if specified
             if sample_size is not None and total_rows >= sample_size:
@@ -600,7 +651,7 @@ def run_domains_only_pipeline(
             
             # Use UMAP with reduced data
             reducer = umap.UMAP(
-                n_neighbors=min(15, len(all_features) - 1),
+                n_neighbors=min(15, len(features) - 1),
                 min_dist=0.1,
                 n_components=2,
                 random_state=random_seed
@@ -609,7 +660,7 @@ def run_domains_only_pipeline(
             
             # Perform clustering
             if n_clusters is None:
-                n_clusters = min(20, len(all_features) // 3)
+                n_clusters = min(20, len(features) // 3)
             
             clusterer = MiniBatchKMeans(
                 n_clusters=n_clusters,
@@ -623,7 +674,7 @@ def run_domains_only_pipeline(
         for cluster_id in range(n_clusters):
             indices = np.where(cluster_labels == cluster_id)[0]
             domain_name = f"domain_{cluster_id}"
-            feature_groups[domain_name] = [all_features[i] for i in indices]
+            feature_groups[domain_name] = [features[i] for i in indices]
         
         # Save results
         results['feature_groups'] = feature_groups
@@ -632,7 +683,7 @@ def run_domains_only_pipeline(
         # Save domain data
         try:
             domain_data = []
-            for feature_idx, feature in enumerate(all_features):
+            for feature_idx, feature in enumerate(features):
                 domain_data.append({
                     'feature': feature,
                     'domain_id': int(cluster_labels[feature_idx]),
@@ -663,7 +714,7 @@ def run_domains_only_pipeline(
                 visualize_feature_domains(
                     final_embedding,
                     cluster_labels,
-                    all_features,
+                    features,
                     max_features=100  # Limit number of features shown
                 ).savefig(plot_path, dpi=300, bbox_inches='tight')
                 results['plot_path'] = plot_path
@@ -673,7 +724,7 @@ def run_domains_only_pipeline(
                 visualize_domain_heatmap(
                     final_embedding,
                     cluster_labels,
-                    all_features,
+                    features,
                     save_path=heatmap_path
                 )
                 results['heatmap_path'] = heatmap_path
