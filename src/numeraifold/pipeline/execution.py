@@ -16,6 +16,7 @@ import umap
 import os
 import traceback
 from typing import Optional, Dict
+import pyarrow.parquet as pq
 
 # Sklearn
 from sklearn.preprocessing import StandardScaler
@@ -471,7 +472,6 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
 
 def chunked_data_loader(data_version: str, feature_set: str, chunk_size: int = 10000):
     """Generator to load data in chunks."""
-    import pyarrow.parquet as pq
     
     file_path = f"{data_version}/train.parquet"
     
@@ -498,6 +498,8 @@ def chunked_data_loader(data_version: str, feature_set: str, chunk_size: int = 1
 def run_domains_only_pipeline(
     data_version: str = "v5.0",
     feature_set: str = "medium",
+    main_target: str = "target",
+    num_aux_targets: int = 3,
     sample_size: Optional[int] = None,
     n_clusters: Optional[int] = None,
     save_path: str = 'feature_domains_data.csv',
@@ -546,7 +548,13 @@ def run_domains_only_pipeline(
         total_rows = 0
         
         print("Processing data chunks...")
-        for chunk, features in chunked_data_loader(data_version, feature_set, chunk_size):
+        for chunk, features, targets in chunked_data_loader(
+            data_version, 
+            feature_set, 
+            main_target=main_target,
+            num_aux_targets=num_aux_targets,
+            chunk_size=chunk_size
+        ):
             if all_features is None:
                 all_features = features
             

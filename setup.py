@@ -41,6 +41,8 @@ setup(
         "numerblox>=0.1.0",
         "plotly>=5.3.0",
         "PyYAML>=6.0",
+        "psutil>=5.8.0",
+        "pyarrow>=6.0.0"
     ],
     extras_require={
         "dev": [
