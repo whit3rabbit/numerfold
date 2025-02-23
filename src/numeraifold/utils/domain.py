@@ -1,5 +1,6 @@
 import numpy as np
-
+import pandas as pd
+import os
 from numeraifold.utils.artifacts import load_and_analyze_domains
 
 
@@ -93,3 +94,39 @@ def integrate_domain_data_to_pipeline(run_alphafold_pipeline, domains_csv_path='
             return run_alphafold_pipeline(train_df, val_df, features, targets, *args, **kwargs)
 
     return wrapped_pipeline
+
+def check_phase1_files(domains_save_path):
+    """Check if Phase 1 output files exist."""
+    return os.path.exists(domains_save_path)
+
+def load_phase1_data(domains_save_path):
+    """Load Phase 1 data from saved domain file."""
+    try:
+        # Load domain data
+        domains_df = pd.read_csv(domains_save_path)
+
+        # Initialize variables
+        embedding = None
+        cluster_labels = None
+
+        # Reconstruct feature groups from the domains file
+        feature_groups = {}
+        for domain_id in domains_df['domain_id'].unique():
+            domain_name = f"domain_{domain_id}"
+            domain_features = domains_df[domains_df['domain_id'] == domain_id]['feature'].tolist()
+            feature_groups[domain_name] = domain_features
+
+        # Load embeddings and cluster labels if available
+        if 'dimension_1' in domains_df.columns and 'dimension_2' in domains_df.columns:
+            embedding = domains_df[['dimension_1', 'dimension_2']].values
+            cluster_labels = domains_df['domain_id'].values
+
+        return {
+            'feature_groups': feature_groups,
+            'embedding': embedding,
+            'cluster_labels': cluster_labels,
+            'domains_df': domains_df
+        }
+    except Exception as e:
+        print(f"Error loading Phase 1 data: {e}")
+        return None
