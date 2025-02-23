@@ -31,7 +31,7 @@ setup(
         "numpy>=1.19.0",
         "pandas>=1.3.0",
         "scikit-learn>=0.24.0",
-        "umap-learn>=0.5.0",
+        "umap-learn>=0.5.7",
         "hdbscan>=0.8.0",
         "lightgbm>=3.2.0",
         "tqdm>=4.62.0",
@@ -43,17 +43,17 @@ setup(
         "PyYAML>=6.0",
     ],
     extras_require={
-        'dev': [
-            'pytest>=6.0',
-            'pytest-cov>=2.0',
-            'black>=21.0',
-            'isort>=5.0',
-            'flake8>=3.9',
+        "dev": [
+            "pytest>=6.0",
+            "pytest-cov>=2.0",
+            "black>=21.0",
+            "isort>=5.0",
+            "flake8>=3.9",
         ],
-        'docs': [
-            'sphinx>=4.0',
-            'sphinx-rtd-theme>=0.5',
-            'myst-parser>=0.15',
+        "docs": [
+            "sphinx>=4.0",
+            "sphinx-rtd-theme>=0.5",
+            "myst-parser>=0.15",
         ],
-    }
+    },
 )
