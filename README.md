@@ -16,46 +16,6 @@ NumerAIFold is a Python project that adapts concepts from AlphaFold, a groundbre
 
 This project is currently in **alpha** status.  It's a research project and is not guaranteed to produce winning submissions in the Numerai Tournament.
 
-**1. `pip install` Instructions**
-
-We'll add instructions for installing directly from GitHub using `pip`. This is the preferred method for most users, as it handles dependencies automatically. We'll also cover the case where someone clones the repository and wants to install locally.
-
-**2. Relative Imports: Explanation and (Possible) Change**
-
-*   **The Issue:** Your current project structure uses relative imports (e.g., `from .core import model` within files in the `src/numeraifold` directory). This works fine when you're *inside* the `src` directory (as we did with `%cd numeraifold/src` in the Colab example). However, it creates problems if someone tries to import your package *after* installing it with `pip`.  The installed package won't have the same relative structure.
-
-*   **Two Solutions (You need to choose ONE):**
-
-    *   **Solution 1 (Recommended - Keep Relative Imports, Use Editable Install):**  Keep the relative imports *and* instruct users to install in "editable" mode (`pip install -e .`).  This is the best option for development, and it's also suitable for users who want to modify the code.  It creates a symbolic link to your project directory, so changes you make are immediately reflected without reinstalling.
-
-    *   **Solution 2 (Change to Absolute Imports):**  Change all your relative imports to absolute imports (e.g., `from numeraifold.core import model`). This is cleaner for standard installation (`pip install .`), but it makes development slightly more cumbersome, because you need to reinstall the package after every code change.
-
-    **I strongly recommend Solution 1 (editable install) for this project.** It's the standard practice for packages under development, and it's more flexible for users.  I'll update the `README.md` with this approach.
-
-**3. ASCII Directory Tree**
-
-We'll add a clear ASCII representation of your project's directory structure to the `README.md`. This helps users understand how the code is organized.
-
-**Updated `README.md`**
-
-```markdown
-# NumerAIFold: AlphaFold-Inspired Pipeline for Numerai
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/release/python-380/)
-[![Development Status](https://img.shields.io/badge/development%20status-alpha-orange.svg)]()
-
-## Description
-
-NumerAIFold is a Python project that adapts concepts from AlphaFold, a groundbreaking protein structure prediction model, to the Numerai Tournament. It aims to improve prediction accuracy by:
-
-1.  **Identifying Feature Domains:**  The pipeline clusters Numerai's features into "domains" of related features using dimensionality reduction (PCA and UMAP) and clustering (KMeans).
-2.  **Building a Transformer Model:** A custom transformer model, inspired by AlphaFold's architecture, is trained to capture complex relationships within and between these feature domains.
-3.  **Generating AlphaFold-Inspired Features:**  The model generates embeddings and confidence scores, which are used as additional features.
-4.  **Performing Evolutionary Analysis:**  The project includes functions to analyze feature stability and evolution across eras, similar to how AlphaFold analyzes evolutionary conservation in protein sequences.
-
-This project is currently in **alpha** status.  It's a research project and is not guaranteed to produce winning submissions in the Numerai Tournament.
-
 ## Installation
 
 ### Option 1: Install Directly from GitHub (Recommended)
