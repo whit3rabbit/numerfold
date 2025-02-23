@@ -547,40 +547,52 @@ def run_domains_only_pipeline(
     random_seed: int = 42
 ) -> Dict:
     """
-    Args:
-        data_version: Version of dataset to use
-        feature_set: Size of feature set ('small', 'medium', 'all')
-        main_target: Primary target column name
-        num_aux_targets: Number of auxiliary targets to include
-        sample_size: Number of rows to sample (None for full dataset)
-        n_clusters: Number of clusters (None for auto-calculation)
-        save_path: Path to save domain data
-        chunk_size: Size of chunks for processing
-        use_incremental: Whether to use incremental learning
-        skip_visualizations: Whether to skip visualization generation
-        random_seed: Random seed for reproducibility
-    
+    Runs the pipeline for processing feature domains from the dataset.
+
+    This function loads data, processes it in chunks (with optional incremental learning),
+    applies dimensionality reduction and clustering to group features into domains, saves the
+    resulting domain information, and optionally generates visualizations.
+
+    Parameters:
+        data_version (str): Version of the dataset to use.
+        feature_set (str): Size of the feature set; options include 'small', 'medium', or 'all'.
+        main_target (str): Primary target column name.
+        num_aux_targets (int): Number of auxiliary targets to include if aux_targets is not provided.
+        aux_targets (Optional[List[str]]): List of specific auxiliary target names to use. Overrides num_aux_targets if provided.
+        sample_size (Optional[int]): Number of rows to sample from training data (None means use the full dataset).
+        n_clusters (Optional[int]): Number of clusters for domain grouping (None triggers auto-calculation).
+        save_path (str): File path to save the domain data CSV.
+        chunk_size (int): Number of rows to process per chunk.
+        use_incremental (bool): Flag to use incremental learning methods.
+        skip_visualizations (bool): If True, skips generation of visualizations.
+        random_seed (int): Random seed for reproducibility.
+
     Returns:
-        Dictionary containing results and paths to saved files
+        Dict: Dictionary containing:
+            - 'feature_groups': Mapping of domain names to lists of features.
+            - 'num_domains': Total number of domains created.
+            - 'targets_used': List of target columns used.
+            - Additional keys for file paths of saved visualizations and any error messages.
     """
+    # Start of pipeline execution
     print(f"Starting optimized domain pipeline with {feature_set} feature set")
     log_memory_usage("Initial")
     
     results = {}
     
     try:
-        # Load data using the load_data function with proper target handling
+        # Load data with proper target handling
         print("Loading data...")
-        
         if aux_targets is not None:
             print(f"Using specified auxiliary targets: {aux_targets}")
             train_df, val_df, features, all_targets = load_data(
                 data_version=data_version,
                 feature_set=feature_set,
                 main_target=main_target,
-                num_aux_targets=0
+                num_aux_targets=0  # When aux_targets provided, don't auto-select additional targets
             )
             
+            # Verify that all specified auxiliary targets exist in the data
             missing_targets = [t for t in aux_targets if t not in train_df.columns]
             if missing_targets:
                 raise ValueError(f"Specified auxiliary targets not found in data: {missing_targets}")
@@ -606,7 +618,7 @@ def run_domains_only_pipeline(
             print(f"Sampling {sample_size} rows from training data")
             train_df = train_df.sample(n=sample_size, random_state=random_seed)
         
-        # Initialize incremental learning models
+        # Set up incremental learning models if enabled
         if use_incremental:
             n_components = 50
             ipca = IncrementalPCA(n_components=n_components, batch_size=chunk_size)
@@ -616,57 +628,58 @@ def run_domains_only_pipeline(
                 batch_size=chunk_size
             )
         
-        # Process data in chunks
+        # Process data in chunks for scalability
         feature_matrices = []
         chunks_processed = 0
         total_rows = 0
         
-        # Split training data into chunks
+        # Divide training data indices into chunks
         num_chunks = max(1, len(train_df) // chunk_size)
         chunk_indices = np.array_split(train_df.index, num_chunks)
         
         print(f"Processing {len(chunk_indices)} chunks...")
-        last_chunk = None  # Store the last processed chunk
+        last_chunk = None  # To store the most recent processed chunk
         
         for chunk_idx in chunk_indices:
             chunk = train_df.loc[chunk_idx]
             
-            # Standardize features
+            # Standardize features: fill missing values and apply scaling
             chunk_features = chunk[features].fillna(0).values
             scaler = StandardScaler()
             chunk_features = scaler.fit_transform(chunk_features)
             
             if use_incremental:
-                # Update incremental models
+                # Update incremental models with the current chunk
                 ipca.partial_fit(chunk_features)
                 clusterer.partial_fit(chunk_features)
-                last_chunk = chunk_features  # Store this chunk
+                last_chunk = chunk_features  # Save the latest chunk for final transformation
             else:
-                # Store chunk for later processing
+                # Store chunk features for batch processing later
                 feature_matrices.append(chunk_features)
             
             chunks_processed += 1
             total_rows += len(chunk)
             
+            # Log memory usage every 10 chunks for monitoring purposes
             if chunks_processed % 10 == 0:
                 log_memory_usage(f"After chunk {chunks_processed}")
         
         print(f"Processed {chunks_processed} chunks, total {total_rows} rows")
         
-        # Perform dimensionality reduction
+        # Dimensionality reduction and clustering
         if use_incremental:
             if last_chunk is None:
                 raise ValueError("No data chunks were processed")
-            # Transform the last chunk to get the final embedding
+            # Transform the last chunk to obtain the final embedding
             final_embedding = ipca.transform(last_chunk)
             cluster_labels = clusterer.predict(final_embedding)
         else:
-            # Traditional approach with full data
+            # For non-incremental, combine all chunks and apply PCA and UMAP
             combined_features = np.vstack(feature_matrices)
             pca = IncrementalPCA(n_components=50, batch_size=chunk_size)
             pca_result = pca.fit_transform(combined_features)
             
-            # Use UMAP with reduced data
+            # Apply UMAP for further dimensionality reduction
             reducer = umap.UMAP(
                 n_neighbors=min(15, len(features) - 1),
                 min_dist=0.1,
@@ -675,7 +688,7 @@ def run_domains_only_pipeline(
             )
             final_embedding = reducer.fit_transform(pca_result)
             
-            # Perform clustering
+            # Determine number of clusters if not specified
             if n_clusters is None:
                 n_clusters = min(20, len(features) // 3)
             
@@ -686,20 +699,20 @@ def run_domains_only_pipeline(
             )
             cluster_labels = clusterer.fit_predict(final_embedding)
         
-        # Create feature groups
+        # Group features by cluster to define domains
         feature_groups = {}
-        n_clusters = len(np.unique(cluster_labels))
-        for cluster_id in range(n_clusters):
+        unique_clusters = np.unique(cluster_labels)
+        for cluster_id in unique_clusters:
             indices = np.where(cluster_labels == cluster_id)[0]
             domain_name = f"domain_{cluster_id}"
             feature_groups[domain_name] = [features[i] for i in indices]
         
-        # Save results
+        # Record results
         results['feature_groups'] = feature_groups
         results['num_domains'] = len(feature_groups)
         results['targets_used'] = all_targets
         
-        # Save domain data
+        # Save domain data to CSV
         try:
             domain_data = []
             for feature_idx, feature in enumerate(features):
@@ -719,7 +732,7 @@ def run_domains_only_pipeline(
             print(f"Error saving domain data: {save_error}")
             results['save_error'] = str(save_error)
         
-        # Generate visualizations if requested
+        # Generate visualizations if not skipped
         if not skip_visualizations:
             try:
                 from numeraifold.domains.visualization import (
@@ -728,7 +741,7 @@ def run_domains_only_pipeline(
                     create_interactive_domain_visualization
                 )
                 
-                # Save visualizations with memory-efficient settings
+                # Create and save a scatter plot of feature domains
                 base_path = save_path.replace('.csv', '')
                 plot_path = f"{base_path}_plot.png"
                 visualize_feature_domains(
@@ -739,7 +752,7 @@ def run_domains_only_pipeline(
                 ).savefig(plot_path, dpi=300, bbox_inches='tight')
                 results['plot_path'] = plot_path
                 
-                # Save other visualizations
+                # Create and save a heatmap visualization
                 heatmap_path = f"{base_path}_heatmap.png"
                 visualize_domain_heatmap(
                     final_embedding,
