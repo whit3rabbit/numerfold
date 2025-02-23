@@ -17,11 +17,13 @@ import os
 import traceback
 from typing import Optional, Dict, List
 import pyarrow.parquet as pq
+import seaborn as sns
+from collections import defaultdict
 
 # Sklearn
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA, IncrementalPCA
-from sklearn.cluster import KMeans, MiniBatchKMeans
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.manifold import TSNE
 
 # Configuration and seed settings
 from numeraifold.config import RANDOM_SEED
@@ -539,21 +541,21 @@ def run_domains_only_pipeline(
     num_aux_targets: int = 3,
     aux_targets: Optional[List[str]] = None,
     sample_size: Optional[int] = None,
-    n_clusters: Optional[int] = None,
+    n_clusters: Optional[int] = None,  # if None, dynamic clustering will determine optimal clusters
     save_path: str = 'feature_domains_data.csv',
     chunk_size: int = 10000,
     use_incremental: bool = True,
     skip_visualizations: bool = False,
     random_seed: int = 42
 ) -> Dict:
-    
-    print(f"Starting optimized domain pipeline with {feature_set} feature set")
+    print(f"Starting enhanced domain pipeline with {feature_set} feature set")
     log_memory_usage("Initial")
-    
     results = {}
-    
+
     try:
-        # Load data
+        # ---------------------------
+        # 1. Data Loading & Preparation
+        # ---------------------------
         print("Loading data...")
         if aux_targets is not None:
             print(f"Using specified auxiliary targets: {aux_targets}")
@@ -582,19 +584,21 @@ def run_domains_only_pipeline(
         print(f"Loaded data with {len(features)} features")
         print(f"Using targets: {all_targets}")
         print(f"Train shape: {train_df.shape}, Val shape: {val_df.shape}")
-        
+
         # Apply sampling if specified
         if sample_size is not None and sample_size < len(train_df):
             print(f"Sampling {sample_size} rows from training data")
             train_df = train_df.sample(n=sample_size, random_state=random_seed)
         
-        # Compute feature-target correlations to create feature embeddings
+        # ---------------------------
+        # 2. Compute Feature-Target Correlations
+        # ---------------------------
         print("Computing feature-target correlations...")
         correlations = []
         for feature in features:
             feature_corrs = []
             for target in all_targets:
-                # Handle NaN values by filling with 0
+                # Handle NaNs by filling with 0
                 feature_data = train_df[feature].fillna(0).values
                 target_data = train_df[target].fillna(0).values
                 corr = np.corrcoef(feature_data, target_data)[0, 1]
@@ -603,38 +607,54 @@ def run_domains_only_pipeline(
         correlations = np.array(correlations)
         print(f"Correlation matrix shape: {correlations.shape}")
         
-        # Apply PCA on feature correlations to reduce dimensions
-        n_components = min(10, len(all_targets))
-        print(f"Applying PCA with {n_components} components on feature correlations...")
-        pca = PCA(n_components=n_components)
-        feature_embeddings = pca.fit_transform(correlations)
+        # ---------------------------
+        # 3. Enhanced Embeddings using t-SNE
+        # ---------------------------
+        print("Applying t-SNE for enhanced feature embeddings...")
+        tsne = TSNE(n_components=3, perplexity=30, random_state=random_seed)
+        feature_embeddings = tsne.fit_transform(correlations)
         print(f"Feature embeddings shape: {feature_embeddings.shape}")
-        
-        # Determine number of clusters if not provided
+
+        # ---------------------------
+        # 4. Dynamic Cluster Determination
+        # ---------------------------
         if n_clusters is None:
-            n_clusters = min(20, len(features) // 3)
+            print("Determining optimal number of clusters dynamically using silhouette scores...")
+            silhouette_scores = []
+            k_range = range(10, 30)
+            for k in k_range:
+                clusterer = KMeans(n_clusters=k, random_state=random_seed)
+                labels = clusterer.fit_predict(feature_embeddings)
+                score = silhouette_score(feature_embeddings, labels)
+                silhouette_scores.append(score)
+                print(f"Silhouette score for k={k}: {score:.4f}")
+            optimal_k = k_range[np.argmax(silhouette_scores)]
+            n_clusters = optimal_k
+            print(f"Optimal number of clusters determined: {n_clusters}")
+        else:
+            print(f"Using user-specified number of clusters: {n_clusters}")
+
+        # ---------------------------
+        # 5. Clustering Features using KMeans
+        # ---------------------------
         print(f"Clustering features into {n_clusters} domains...")
-        
-        # Cluster features using KMeans
         clusterer = KMeans(n_clusters=n_clusters, random_state=random_seed)
         cluster_labels = clusterer.fit_predict(feature_embeddings)
-        
-        # Create feature groups based on feature-level clustering
-        from collections import defaultdict
+
+        # Create feature groups (domains)
         feature_groups = defaultdict(list)
         for idx, label in enumerate(cluster_labels):
             domain_name = f"domain_{label}"
             feature_groups[domain_name].append(features[idx])
-        
-        # Convert defaultdict to dict
         feature_groups = dict(feature_groups)
-        
-        # Save results
+
+        # ---------------------------
+        # 6. Save Domain Data
+        # ---------------------------
         results['feature_groups'] = feature_groups
         results['num_domains'] = len(feature_groups)
         results['targets_used'] = all_targets
-        
-        # Save domain data to CSV
+
         try:
             print("Saving domain data...")
             domain_data = []
@@ -653,18 +673,44 @@ def run_domains_only_pipeline(
             print(f"Error saving domain data: {save_error}")
             results['save_error'] = str(save_error)
         
-        # Generate visualizations if not skipped
+        # ---------------------------
+        # 7. Cluster Validation: Intra-domain Correlation Analysis
+        # ---------------------------
+        print("Performing cluster validation via intra-domain correlation analysis...")
+        domain_corr_matrix = np.zeros((n_clusters, len(all_targets)))
+        for domain_id in range(n_clusters):
+            domain_features = [features[i] for i, label in enumerate(cluster_labels) if label == domain_id]
+            for j, target in enumerate(all_targets):
+                # Compute average correlation of each feature in the domain with the target
+                corrs = [
+                    np.corrcoef(train_df[feat].fillna(0).values, train_df[target].fillna(0).values)[0, 1]
+                    for feat in domain_features
+                ]
+                domain_corr_matrix[domain_id, j] = np.mean(corrs)
+        plt.figure(figsize=(12, 8))
+        sns.heatmap(domain_corr_matrix, annot=True, cmap="coolwarm")
+        plt.title("Domain Correlation Matrix with Targets")
+        plt.xlabel("Targets")
+        plt.ylabel("Domains")
+        plt.show()
+        # Optionally, you can save this plot:
+        # plt.savefig(save_path.replace('.csv', '_domain_validation.png'), dpi=120, bbox_inches='tight')
+        results['domain_validation'] = domain_corr_matrix.tolist()
+        
+        # ---------------------------
+        # 8. Additional Visualizations
+        # ---------------------------
         if not skip_visualizations:
             try:
-                print("Generating visualizations...")
-                # Example visualization using UMAP on feature embeddings
+                print("Generating additional visualizations using UMAP...")
                 reducer = umap.UMAP(random_state=random_seed)
                 vis_embeddings = reducer.fit_transform(feature_embeddings)
                 
                 plt.figure(figsize=(10, 8))
-                scatter = plt.scatter(vis_embeddings[:,0], vis_embeddings[:,1], c=cluster_labels, cmap='tab20', s=10)
+                scatter = plt.scatter(vis_embeddings[:, 0], vis_embeddings[:, 1],
+                                      c=cluster_labels, cmap='tab20', s=10)
                 plt.colorbar(scatter)
-                plt.title("Feature Domains Visualization")
+                plt.title("Feature Domains Visualization (UMAP)")
                 
                 plot_path = save_path.replace('.csv', '_plot.png')
                 plt.savefig(plot_path, dpi=120, bbox_inches='tight')
@@ -676,7 +722,7 @@ def run_domains_only_pipeline(
                 results['visualization_error'] = str(viz_error)
         
         return results
-    
+
     except Exception as e:
         print(f"Pipeline error: {e}")
         traceback.print_exc()
