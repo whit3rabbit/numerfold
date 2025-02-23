@@ -15,7 +15,7 @@ import traceback
 import umap
 import os
 import traceback
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import pyarrow.parquet as pq
 
 # Sklearn
@@ -492,7 +492,6 @@ def chunked_data_loader(
             'main_target': 'target',
             'num_aux_targets': 3
         }
-    import pyarrow.parquet as pq
     
     file_path = f"{data_version}/train.parquet"
     
@@ -538,6 +537,7 @@ def run_domains_only_pipeline(
     feature_set: str = "medium",
     main_target: str = "target",
     num_aux_targets: int = 3,
+    aux_targets: Optional[List[str]] = None,
     sample_size: Optional[int] = None,
     n_clusters: Optional[int] = None,
     save_path: str = 'feature_domains_data.csv',
@@ -547,8 +547,6 @@ def run_domains_only_pipeline(
     random_seed: int = 42
 ) -> Dict:
     """
-    Memory-optimized domain extraction pipeline.
-    
     Args:
         data_version: Version of dataset to use
         feature_set: Size of feature set ('small', 'medium', 'all')
@@ -571,24 +569,46 @@ def run_domains_only_pipeline(
     results = {}
     
     try:
-        # Load data using the load_data function
+        # Load data using the load_data function with proper target handling
         print("Loading data...")
-        train_df, val_df, features, targets = load_data(
-            data_version=data_version,
-            feature_set=feature_set,
-            main_target=main_target,
-            num_aux_targets=num_aux_targets
-        )
+        
+        if aux_targets is not None:
+            print(f"Using specified auxiliary targets: {aux_targets}")
+            train_df, val_df, features, all_targets = load_data(
+                data_version=data_version,
+                feature_set=feature_set,
+                main_target=main_target,
+                num_aux_targets=0
+            )
+            
+            missing_targets = [t for t in aux_targets if t not in train_df.columns]
+            if missing_targets:
+                raise ValueError(f"Specified auxiliary targets not found in data: {missing_targets}")
+            all_targets = [main_target] + aux_targets
+        else:
+            print(f"Selecting {num_aux_targets} random auxiliary targets")
+            train_df, val_df, features, all_targets = load_data(
+                data_version=data_version,
+                feature_set=feature_set,
+                main_target=main_target,
+                num_aux_targets=num_aux_targets
+            )
         
         if train_df is None or val_df is None:
             raise ValueError("Failed to load data")
             
-        print(f"Loaded data with {len(features)} features and {len(targets)} targets")
+        print(f"Loaded data with {len(features)} features")
+        print(f"Using targets: {all_targets}")
         print(f"Train shape: {train_df.shape}, Val shape: {val_df.shape}")
         
-        # Initialize incremental learning models if specified
+        # Apply sampling if specified
+        if sample_size is not None and sample_size < len(train_df):
+            print(f"Sampling {sample_size} rows from training data")
+            train_df = train_df.sample(n=sample_size, random_state=random_seed)
+        
+        # Initialize incremental learning models
         if use_incremental:
-            n_components = 50  # Reduced from typical 100+ to save memory
+            n_components = 50
             ipca = IncrementalPCA(n_components=n_components, batch_size=chunk_size)
             clusterer = MiniBatchKMeans(
                 n_clusters=n_clusters if n_clusters is not None else 20,
@@ -606,13 +626,11 @@ def run_domains_only_pipeline(
         chunk_indices = np.array_split(train_df.index, num_chunks)
         
         print(f"Processing {len(chunk_indices)} chunks...")
+        last_chunk = None  # Store the last processed chunk
+        
         for chunk_idx in chunk_indices:
             chunk = train_df.loc[chunk_idx]
             
-            # Apply sampling if specified
-            if sample_size is not None and total_rows >= sample_size:
-                continue
-                
             # Standardize features
             chunk_features = chunk[features].fillna(0).values
             scaler = StandardScaler()
@@ -622,6 +640,7 @@ def run_domains_only_pipeline(
                 # Update incremental models
                 ipca.partial_fit(chunk_features)
                 clusterer.partial_fit(chunk_features)
+                last_chunk = chunk_features  # Store this chunk
             else:
                 # Store chunk for later processing
                 feature_matrices.append(chunk_features)
@@ -636,13 +655,11 @@ def run_domains_only_pipeline(
         
         # Perform dimensionality reduction
         if use_incremental:
-            # Transform using incremental PCA
-            if feature_matrices:
-                final_embedding = ipca.transform(np.vstack(feature_matrices))
-            else:
-                final_embedding = ipca.transform(feature_matrices[-1])  # Last chunk
-                
-            cluster_labels = clusterer.labels_
+            if last_chunk is None:
+                raise ValueError("No data chunks were processed")
+            # Transform the last chunk to get the final embedding
+            final_embedding = ipca.transform(last_chunk)
+            cluster_labels = clusterer.predict(final_embedding)
         else:
             # Traditional approach with full data
             combined_features = np.vstack(feature_matrices)
@@ -671,6 +688,7 @@ def run_domains_only_pipeline(
         
         # Create feature groups
         feature_groups = {}
+        n_clusters = len(np.unique(cluster_labels))
         for cluster_id in range(n_clusters):
             indices = np.where(cluster_labels == cluster_id)[0]
             domain_name = f"domain_{cluster_id}"
@@ -679,6 +697,7 @@ def run_domains_only_pipeline(
         # Save results
         results['feature_groups'] = feature_groups
         results['num_domains'] = len(feature_groups)
+        results['targets_used'] = all_targets
         
         # Save domain data
         try:
@@ -710,17 +729,18 @@ def run_domains_only_pipeline(
                 )
                 
                 # Save visualizations with memory-efficient settings
-                plot_path = save_path.replace('.csv', '_plot.png')
+                base_path = save_path.replace('.csv', '')
+                plot_path = f"{base_path}_plot.png"
                 visualize_feature_domains(
                     final_embedding,
                     cluster_labels,
                     features,
-                    max_features=100  # Limit number of features shown
+                    max_features=100
                 ).savefig(plot_path, dpi=300, bbox_inches='tight')
                 results['plot_path'] = plot_path
                 
                 # Save other visualizations
-                heatmap_path = save_path.replace('.csv', '_heatmap.png')
+                heatmap_path = f"{base_path}_heatmap.png"
                 visualize_domain_heatmap(
                     final_embedding,
                     cluster_labels,
