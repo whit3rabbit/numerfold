@@ -104,6 +104,10 @@ def load_phase1_data(domains_save_path):
     try:
         # Load domain data
         domains_df = pd.read_csv(domains_save_path)
+        
+        if domains_df.empty:
+            print("Warning: Empty domains file")
+            return None
 
         # Initialize variables
         embedding = None
@@ -111,15 +115,26 @@ def load_phase1_data(domains_save_path):
 
         # Reconstruct feature groups from the domains file
         feature_groups = {}
-        for domain_id in domains_df['domain_id'].unique():
-            domain_name = f"domain_{domain_id}"
+        unique_domains = domains_df['domain_id'].unique()
+        
+        if len(unique_domains) == 0:
+            print("Warning: No domains found in file")
+            return None
+            
+        for domain_id in unique_domains:
+            domain_name = f"domain_{int(domain_id)}"
             domain_features = domains_df[domains_df['domain_id'] == domain_id]['feature'].tolist()
-            feature_groups[domain_name] = domain_features
+            if domain_features:  # Only add non-empty domains
+                feature_groups[domain_name] = domain_features
 
         # Load embeddings and cluster labels if available
-        if 'dimension_1' in domains_df.columns and 'dimension_2' in domains_df.columns:
+        if all(col in domains_df.columns for col in ['dimension_1', 'dimension_2']):
             embedding = domains_df[['dimension_1', 'dimension_2']].values
             cluster_labels = domains_df['domain_id'].values
+
+        if not feature_groups:
+            print("Warning: No valid feature groups created from domain data")
+            return None
 
         return {
             'feature_groups': feature_groups,

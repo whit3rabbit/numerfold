@@ -75,7 +75,7 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
         dict: Results dictionary containing domain data, trained model, evaluation metrics, etc.
     """
     print("Starting AlphaFold-inspired Numerai pipeline...")
-
+    
     # Set random seed for reproducibility
     np.random.seed(random_seed)
     torch.manual_seed(random_seed)
@@ -94,56 +94,52 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
             print(f"Skipping Phase 1. Loading domain data from: {domains_save_path}")
             # Use the utility to load domain data
             phase1_data = load_and_analyze_domains(domains_save_path)
-            if phase1_data is not None:
-                results.update(phase1_data)
-                feature_groups = phase1_data.get('feature_groups')
-                embedding = phase1_data.get('embedding')
-                cluster_labels = phase1_data.get('cluster_labels')
-                print(f"Successfully loaded {len(feature_groups)} feature groups from saved data.")
+            
+            if phase1_data is not None and isinstance(phase1_data, dict):
+                if 'create_feature_groups' in phase1_data and callable(phase1_data['create_feature_groups']):
+                    feature_groups = phase1_data['create_feature_groups']()
+                    embedding = phase1_data.get('data', {}).get('embedding', None)
+                    if 'data' in phase1_data and isinstance(phase1_data['data'], pd.DataFrame):
+                        cluster_labels = phase1_data['data']['domain_id'].values if 'domain_id' in phase1_data['data'].columns else None
+                    
+                    if feature_groups:
+                        print(f"Successfully loaded {len(feature_groups)} feature groups from saved data.")
+                        results.update(phase1_data)
+                    else:
+                        print("Failed to create feature groups from saved data. Proceeding with Phase 1.")
+                        skip_phase1 = False
+                else:
+                    print("Invalid domain data format. Proceeding with Phase 1.")
+                    skip_phase1 = False
             else:
                 print(f"Error loading domain data from {domains_save_path}. Proceeding with Phase 1.")
-                skip_phase1 = False  # Fallback to running Phase 1 if loading fails
+                skip_phase1 = False
 
-        if not skip_phase1:
-            # Check if cached domain data exists using os.path.exists
-            if not force_phase1 and os.path.exists(domains_save_path):
-                print(f"Found existing domain data at {domains_save_path}. Loading data...")
-                phase1_data = load_and_analyze_domains(domains_save_path)
-                if phase1_data is not None:
-                    results.update(phase1_data)
-                    feature_groups = phase1_data.get('feature_groups')
-                    embedding = phase1_data.get('embedding')
-                    cluster_labels = phase1_data.get('cluster_labels')
-                    print(f"Successfully loaded {len(feature_groups)} feature groups")
-                else:
-                    print("Failed to load Phase 1 data. Running Phase 1...")
-                    force_phase1 = True
-            else:
-                if force_phase1:
-                    print("Force running Phase 1...")
-                else:
-                    print("No existing domain data found. Running Phase 1...")
-                force_phase1 = True
+        if not skip_phase1 or feature_groups is None:
+            print("Running Phase 1: Feature Domain Identification")
+            # Perform feature domain identification
+            feature_groups, embedding, cluster_labels, _ = identify_feature_domains(
+                train_df, features, n_clusters=n_clusters, random_state=random_seed
+            )
+            
+            if not feature_groups:
+                print("Warning: No feature groups created. Using single group.")
+                feature_groups = {"domain_0": features}
+            
+            results['feature_groups'] = feature_groups
 
-            if force_phase1:
-                # Identify feature domains using dimensionality reduction and clustering
-                feature_groups, embedding, cluster_labels, _ = identify_feature_domains(
-                    train_df, features, n_clusters=n_clusters, random_state=random_seed
-                )
-                results['feature_groups'] = feature_groups
-
-                # Save domain data if requested
-                if save_domains:
-                    try:
-                        saved_path = save_feature_domains_data(
-                            feature_groups, embedding, cluster_labels, features,
-                            output_path=domains_save_path
-                        )
-                        if saved_path:
-                            results['domains_saved_path'] = saved_path
-                            print(f"Feature domain data saved to: {saved_path}")
-                    except Exception as e:
-                        print(f"Warning: Failed to save domain data: {e}")
+            # Save domain data if requested
+            if save_domains:
+                try:
+                    saved_path = save_feature_domains_data(
+                        feature_groups, embedding, cluster_labels, features,
+                        output_path=domains_save_path
+                    )
+                    if saved_path:
+                        results['domains_saved_path'] = saved_path
+                        print(f"Feature domain data saved to: {saved_path}")
+                except Exception as e:
+                    print(f"Warning: Failed to save domain data: {e}")
 
             # Ensure we have feature groups even if identification failed
             if feature_groups is None:

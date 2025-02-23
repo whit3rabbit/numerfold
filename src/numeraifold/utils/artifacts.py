@@ -1,6 +1,7 @@
 import os
 import json
 from datetime import datetime
+import traceback
 from typing import Dict, List, Optional
 
 import torch
@@ -205,8 +206,23 @@ def load_and_analyze_domains(domains_csv_path='feature_domains_data.csv'):
         dict: A dictionary containing analysis results and utility functions.
     """
     try:
+        # Check if file exists
+        if not os.path.exists(domains_csv_path):
+            print(f"Error: Domain data file not found at {domains_csv_path}")
+            return None
+
         # Load the domain data
         df = pd.read_csv(domains_csv_path)
+        if df.empty:
+            print("Error: Empty domain data file")
+            return None
+
+        # Validate required columns
+        required_columns = ['feature', 'domain_id']
+        if not all(col in df.columns for col in required_columns):
+            print(f"Error: Missing required columns. Required: {required_columns}")
+            return None
+
         print(f"Loaded domain data with {len(df)} features across {df['domain_id'].nunique()} domains")
 
         # Compute basic statistics for each domain
@@ -318,12 +334,20 @@ def load_and_analyze_domains(domains_csv_path='feature_domains_data.csv'):
             """Create feature_groups dictionary from domain data."""
             feature_groups = {}
             for domain_id in df['domain_id'].unique():
-                domain_name = f"domain_{domain_id}"
+                domain_name = f"domain_{int(domain_id)}"  # Ensure integer domain ID
                 domain_features = get_domain_features(domain_id)
-                feature_groups[domain_name] = domain_features
+                if domain_features:  # Only add non-empty domains
+                    feature_groups[domain_name] = domain_features
             return feature_groups
 
         analysis['create_feature_groups'] = create_feature_groups
+        
+        # Add feature_groups directly to the analysis dictionary
+        feature_groups = create_feature_groups()
+        if not feature_groups:
+            print("Error: No valid feature groups could be created")
+            return None
+        analysis['feature_groups'] = feature_groups
 
         # Attempt an initial visualization of the domains
         try:
@@ -335,4 +359,6 @@ def load_and_analyze_domains(domains_csv_path='feature_domains_data.csv'):
 
     except Exception as e:
         print(f"Error loading domain data: {e}")
+        print("Traceback:")
+        traceback.print_exc()
         return None
