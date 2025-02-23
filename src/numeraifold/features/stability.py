@@ -144,7 +144,7 @@ def calculate_feature_stability(df, features, era_col='era', window_size=20, ran
                 'mean_stability': np.nan,
                 'corr_stability': np.nan,
                 'rank_stability': np.nan,
-                'cv': np.nan,*************
+                'cv': np.nan,
                 'persistence': np.nan
             })
 
