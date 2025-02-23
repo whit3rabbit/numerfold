@@ -12,6 +12,15 @@ import torch
 import pandas as pd
 import matplotlib.pyplot as plt
 import traceback
+import umap
+import os
+import traceback
+from typing import Optional, Dict
+
+# Sklearn
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import IncrementalPCA
+from sklearn.cluster import MiniBatchKMeans
 
 # Configuration and seed settings
 from numeraifold.config import RANDOM_SEED
@@ -33,6 +42,9 @@ from numeraifold.features.stability import calculate_feature_stability
 
 # Utilities for saving/loading artifacts
 from numeraifold.utils.artifacts import save_model_artifacts, save_feature_domains_data, load_and_analyze_domains
+
+# Logging
+from numeraifold.utils.logging import log_memory_usage
 
 # Download numerai data
 from numeraifold.data.loading import load_data
@@ -457,83 +469,217 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
     print("AlphaFold-inspired pipeline completed")
     return results
 
+def chunked_data_loader(data_version: str, feature_set: str, chunk_size: int = 10000):
+    """Generator to load data in chunks."""
+    import pyarrow.parquet as pq
+    
+    file_path = f"{data_version}/train.parquet"
+    
+    # Read schema and feature metadata
+    schema = pq.read_schema(file_path)
+    with open(f"{data_version}/features.json") as f:
+        import json
+        feature_metadata = json.load(f)
+    features = feature_metadata["feature_sets"][feature_set]
+    
+    # Create ParquetFile object
+    parquet_file = pq.ParquetFile(file_path)
+    
+    # Read in chunks
+    for i in range(0, parquet_file.metadata.num_rows, chunk_size):
+        chunk = pd.read_parquet(
+            file_path,
+            columns=["era"] + features,
+            skip_rows=i,
+            num_rows=min(chunk_size, parquet_file.metadata.num_rows - i)
+        )
+        yield chunk, features
 
 def run_domains_only_pipeline(
-    data_version="v5.0",
-    feature_set="small",
-    sample_size=None,
-    n_clusters=None,
-    save_path='feature_domains_data.csv',
-    main_target="target",
-    num_aux_targets=5
-):
+    data_version: str = "v5.0",
+    feature_set: str = "medium",
+    sample_size: Optional[int] = None,
+    n_clusters: Optional[int] = None,
+    save_path: str = 'feature_domains_data.csv',
+    chunk_size: int = 10000,
+    use_incremental: bool = True,
+    skip_visualizations: bool = False,
+    random_seed: int = 42
+) -> Dict:
     """
-    Run just the domain extraction part of the pipeline.
-    This function loads data, extracts feature domains, and saves both basic and detailed domain information.
+    Memory-optimized domain extraction pipeline.
     
-    Parameters:
-        data_version (str, optional): Identifier for the data version/folder. Defaults to "v5.0".
-        feature_set (str, optional): Size of feature set to use ('small', 'medium', 'all'). Defaults to "small".
-        sample_size (int, optional): Number of rows to sample for domain extraction. If None, uses full dataset.
-            Set to a smaller number (e.g., 50000) for faster processing. Defaults to None.
-        n_clusters (int, optional): Number of clusters for domain extraction. If None, defaults to
-            min(15, len(features) // 3). Defaults to None.
-        save_path (str, optional): Path to save the feature domains data. Defaults to 'feature_domains_data.csv'.
-        main_target (str, optional): The primary target column name. Defaults to "target".
-        num_aux_targets (int, optional): Number of auxiliary target columns to include. Defaults to 5.
+    Args:
+        data_version: Version of dataset to use
+        feature_set: Size of feature set ('small', 'medium', 'all')
+        sample_size: Number of rows to sample (None for full dataset)
+        n_clusters: Number of clusters (None for auto-calculation)
+        save_path: Path to save domain data
+        chunk_size: Size of chunks for processing
+        use_incremental: Whether to use incremental learning
+        skip_visualizations: Whether to skip visualization generation
+        random_seed: Random seed for reproducibility
     
     Returns:
-        dict: Results dictionary containing:
-            - domain information
-            - paths to saved artifacts
-            - error information if any occurred
+        Dictionary containing results and paths to saved files
     """
+    print(f"Starting optimized domain pipeline with {feature_set} feature set")
+    log_memory_usage("Initial")
+    
+    results = {}
+    
     try:
-        print("Loading data...")
-        train_df, val_df, features, targets = load_data(
-            data_version=data_version,
-            feature_set=feature_set,
-            main_target=main_target,
-            num_aux_targets=num_aux_targets
-        )
+        # Initialize incremental learning models if specified
+        if use_incremental:
+            n_components = 50  # Reduced from typical 100+ to save memory
+            ipca = IncrementalPCA(n_components=n_components, batch_size=chunk_size)
+            clusterer = MiniBatchKMeans(
+                n_clusters=n_clusters if n_clusters is not None else 20,
+                random_state=random_seed,
+                batch_size=chunk_size
+            )
         
-        if train_df is None:
-            print("Failed to load data. Exiting.")
-            return None
-            
-        # Sample data if requested and if dataset is large enough
-        if sample_size is not None and len(train_df) > sample_size:
-            print(f"Using a subset of data for faster domain extraction (original size: {len(train_df)})")
-            train_df = train_df.sample(sample_size, random_state=42)
-            
-        # Calculate default number of clusters if not specified
-        if n_clusters is None:
-            n_clusters = min(15, len(features) // 3)
-            
-        # Extract domains using the dedicated function
-        results = extract_feature_domains_only(
-            train_df,
-            features,
-            n_clusters=n_clusters,
-            save_path=save_path
-        )
+        # Process data in chunks
+        feature_matrices = []
+        all_features = None
+        chunks_processed = 0
+        total_rows = 0
         
-        # Save feature list for reference
+        print("Processing data chunks...")
+        for chunk, features in chunked_data_loader(data_version, feature_set, chunk_size):
+            if all_features is None:
+                all_features = features
+            
+            # Apply sampling if specified
+            if sample_size is not None and total_rows >= sample_size:
+                continue
+                
+            # Standardize features
+            chunk_features = chunk[features].fillna(0).values
+            scaler = StandardScaler()
+            chunk_features = scaler.fit_transform(chunk_features)
+            
+            if use_incremental:
+                # Update incremental models
+                ipca.partial_fit(chunk_features)
+                clusterer.partial_fit(chunk_features)
+            else:
+                # Store chunk for later processing
+                feature_matrices.append(chunk_features)
+            
+            chunks_processed += 1
+            total_rows += len(chunk)
+            
+            if chunks_processed % 10 == 0:
+                log_memory_usage(f"After chunk {chunks_processed}")
+        
+        print(f"Processed {chunks_processed} chunks, total {total_rows} rows")
+        
+        # Perform dimensionality reduction
+        if use_incremental:
+            # Transform using incremental PCA
+            if feature_matrices:
+                final_embedding = ipca.transform(np.vstack(feature_matrices))
+            else:
+                final_embedding = ipca.transform(feature_matrices[-1])  # Last chunk
+                
+            cluster_labels = clusterer.labels_
+        else:
+            # Traditional approach with full data
+            combined_features = np.vstack(feature_matrices)
+            pca = IncrementalPCA(n_components=50, batch_size=chunk_size)
+            pca_result = pca.fit_transform(combined_features)
+            
+            # Use UMAP with reduced data
+            reducer = umap.UMAP(
+                n_neighbors=min(15, len(all_features) - 1),
+                min_dist=0.1,
+                n_components=2,
+                random_state=random_seed
+            )
+            final_embedding = reducer.fit_transform(pca_result)
+            
+            # Perform clustering
+            if n_clusters is None:
+                n_clusters = min(20, len(all_features) // 3)
+            
+            clusterer = MiniBatchKMeans(
+                n_clusters=n_clusters,
+                random_state=random_seed,
+                batch_size=chunk_size
+            )
+            cluster_labels = clusterer.fit_predict(final_embedding)
+        
+        # Create feature groups
+        feature_groups = {}
+        for cluster_id in range(n_clusters):
+            indices = np.where(cluster_labels == cluster_id)[0]
+            domain_name = f"domain_{cluster_id}"
+            feature_groups[domain_name] = [all_features[i] for i in indices]
+        
+        # Save results
+        results['feature_groups'] = feature_groups
+        results['num_domains'] = len(feature_groups)
+        
+        # Save domain data
         try:
-            feature_info = pd.DataFrame({'feature_name': features})
-            feature_info.to_csv('feature_list.csv', index=False)
-            print("Feature list saved to feature_list.csv")
-        except Exception as feat_error:
-            print(f"Error saving feature list: {feat_error}")
-            results['feature_list_error'] = str(feat_error)
+            domain_data = []
+            for feature_idx, feature in enumerate(all_features):
+                domain_data.append({
+                    'feature': feature,
+                    'domain_id': int(cluster_labels[feature_idx]),
+                    'domain_name': f"domain_{int(cluster_labels[feature_idx])}",
+                    'dimension_1': final_embedding[feature_idx, 0],
+                    'dimension_2': final_embedding[feature_idx, 1] if final_embedding.shape[1] > 1 else np.nan
+                })
             
-        return results
+            domains_df = pd.DataFrame(domain_data)
+            domains_df.to_csv(save_path, index=False)
+            results['domains_saved_path'] = save_path
+            
+        except Exception as save_error:
+            print(f"Error saving domain data: {save_error}")
+            results['save_error'] = str(save_error)
         
+        # Generate visualizations if requested
+        if not skip_visualizations:
+            try:
+                from numeraifold.domains.visualization import (
+                    visualize_feature_domains,
+                    visualize_domain_heatmap,
+                    create_interactive_domain_visualization
+                )
+                
+                # Save visualizations with memory-efficient settings
+                plot_path = save_path.replace('.csv', '_plot.png')
+                visualize_feature_domains(
+                    final_embedding,
+                    cluster_labels,
+                    all_features,
+                    max_features=100  # Limit number of features shown
+                ).savefig(plot_path, dpi=300, bbox_inches='tight')
+                results['plot_path'] = plot_path
+                
+                # Save other visualizations
+                heatmap_path = save_path.replace('.csv', '_heatmap.png')
+                visualize_domain_heatmap(
+                    final_embedding,
+                    cluster_labels,
+                    all_features,
+                    save_path=heatmap_path
+                )
+                results['heatmap_path'] = heatmap_path
+                
+            except Exception as viz_error:
+                print(f"Error generating visualizations: {viz_error}")
+                results['visualization_error'] = str(viz_error)
+        
+        return results
+    
     except Exception as e:
-        print(f"Error running domains-only pipeline: {e}")
+        print(f"Pipeline error: {e}")
         traceback.print_exc()
         return {'error': str(e)}
-
 
 def extract_feature_domains_only(train_df, features, n_clusters=10,
                                  random_seed=42, save_path='feature_domains_data.csv'):
