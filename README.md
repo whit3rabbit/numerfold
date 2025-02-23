@@ -23,7 +23,7 @@ This project is currently in **alpha** status.  It's a research project and is n
 This method uses `pip` to install the package directly from the GitHub repository.  It's the easiest way to get started.  We use an "editable" install (`-e`) so that any changes you make to the code are immediately reflected.
 
 ```bash
-pip install -e "git+https://github.com/whit3rabbit/numeraifold.git#egg=numeraifold"
+pip install -e "git+https://github.com/whit3rabbit/numeraifold.git"
 ```
 
 ### Option 2: Clone and Install Locally
@@ -180,4 +180,3 @@ Contributions are welcome!  Please see the [issues](https://github.com/whit3rabb
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-```
