@@ -1,10 +1,8 @@
-import os
 from typing import Dict
 import pandas as pd
 
 def generate_visualizations_from_saved_domains(
     domains_path: str,
-    output_dir: str,
     max_features: int = 100
 ) -> Dict:
     """
@@ -12,16 +10,12 @@ def generate_visualizations_from_saved_domains(
     
     Args:
         domains_path: Path to saved domains CSV
-        output_dir: Directory to save visualizations
         max_features: Maximum number of features to show in visualizations
     
     Returns:
         Dictionary with paths to generated visualizations
     """
     try:
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
-        
         # Load domain data
         domains_df = pd.read_csv(domains_path)
         
@@ -29,6 +23,9 @@ def generate_visualizations_from_saved_domains(
         embedding = domains_df[['dimension_1', 'dimension_2']].values
         cluster_labels = domains_df['domain_id'].values
         features = domains_df['feature'].tolist()
+        
+        # Generate base path for visualizations from domains path
+        base_path = domains_path.replace('.csv', '')
         
         # Generate and save visualizations
         from numeraifold.domains.visualization import (
@@ -40,7 +37,7 @@ def generate_visualizations_from_saved_domains(
         results = {}
         
         # Domain plot
-        plot_path = os.path.join(output_dir, 'domains_plot.png')
+        plot_path = f"{base_path}_plot.png"
         visualize_feature_domains(
             embedding,
             cluster_labels,
@@ -49,7 +46,7 @@ def generate_visualizations_from_saved_domains(
         results['plot_path'] = plot_path
         
         # Heatmap
-        heatmap_path = os.path.join(output_dir, 'domains_heatmap.png')
+        heatmap_path = f"{base_path}_heatmap.png"
         visualize_domain_heatmap(
             embedding,
             cluster_labels,
@@ -59,7 +56,7 @@ def generate_visualizations_from_saved_domains(
         results['heatmap_path'] = heatmap_path
         
         # Interactive visualization
-        interactive_path = os.path.join(output_dir, 'domains_interactive.html')
+        interactive_path = f"{base_path}_interactive.html"
         create_interactive_domain_visualization(
             embedding,
             cluster_labels,
