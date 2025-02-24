@@ -113,7 +113,10 @@ def load_data(data_version="v5.0", feature_set="small",
                 if col == 'era':
                     continue
                 field = table.schema.field(col)
-                if pa.types.is_numeric(field.type):
+                field_type = field.type
+                if (pa.types.is_integer(field_type) or 
+                    pa.types.is_floating(field_type) or 
+                    pa.types.is_decimal(field_type)):
                     table = table.set_column(
                         table.column_names.index(col),
                         col,
@@ -128,17 +131,15 @@ def load_data(data_version="v5.0", feature_set="small",
         train_df = table.to_pandas(dtype_backend='pyarrow' if not convert_dtypes else 'numpy')
         
         if max_rows and len(train_df) > max_rows:
-            print(f"Limiting training data to {max_rows} rows")
             train_df = train_df.head(max_rows)
 
-        # Load and process validation data
+        # Load validation data
         table_val = pq.read_table(f"{data_version}/validation.parquet", columns=columns_to_load)
         if convert_dtypes:
             table_val = cast_table_to_float32(table_val)
         val_df = table_val.to_pandas(dtype_backend='pyarrow' if not convert_dtypes else 'numpy')
         
         if max_rows and len(val_df) > max_rows:
-            print(f"Limiting validation data to {max_rows} rows")
             val_df = val_df.head(max_rows)
 
     # Post-processing for chunked data
@@ -160,19 +161,7 @@ def load_data(data_version="v5.0", feature_set="small",
 
 
 def load_data_in_chunks(filepath, columns, chunk_size=10000, max_rows=None, convert_dtypes=True):
-    """
-    Load parquet data in chunks to manage memory usage.
-    
-    Parameters:
-        filepath (str): Path to the parquet file
-        columns (list): List of columns to load
-        chunk_size (int): Number of rows per chunk
-        max_rows (int): Maximum number of rows to load (None for all)
-        convert_dtypes (bool): Whether to convert PyArrow types to standard types
-    
-    Returns:
-        pd.DataFrame: Combined dataframe from all chunks
-    """   
+    """Optimized chunked loading with PyArrow type conversion"""
     parquet_file = pq.ParquetFile(filepath)
     total_rows = parquet_file.metadata.num_rows
     if max_rows:
@@ -180,36 +169,33 @@ def load_data_in_chunks(filepath, columns, chunk_size=10000, max_rows=None, conv
 
     chunks = []
     for i in range(0, total_rows, chunk_size):
-        # Read single row group at a time for efficiency
         row_group = i // parquet_file.metadata.row_group(0).num_rows
         if row_group >= parquet_file.num_row_groups:
             break
 
         table = parquet_file.read_row_group(row_group, columns=columns)
         if convert_dtypes:
-            # Convert numeric columns to float32
             for col in table.column_names:
                 if col == 'era':
                     continue
                 field = table.schema.field(col)
-                if pa.types.is_numeric(field.type):
+                field_type = field.type
+                if (pa.types.is_integer(field_type) or 
+                    pa.types.is_floating(field_type) or 
+                    pa.types.is_decimal(field_type)):
                     table = table.set_column(
                         table.column_names.index(col),
                         col,
                         table[col].cast(pa.float32())
-                    )
         
         df = table.to_pandas()
-        chunks.append(df.iloc[:chunk_size])  # Handle partial row groups
+        chunks.append(df.iloc[:chunk_size])
         
         if max_rows and sum(len(c) for c in chunks) >= max_rows:
             break
 
     result = pd.concat(chunks, ignore_index=True)
-    if max_rows:
-        result = result.head(max_rows)
-    
-    return result
+    return result.head(max_rows) if max_rows else result
 
 def process_in_batches(df, model, features, device='cuda' if torch.cuda.is_available() else 'cpu'):
     """
