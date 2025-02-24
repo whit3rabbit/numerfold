@@ -582,7 +582,7 @@ def run_domains_only_pipeline(
                 data_version=data_version,
                 feature_set=feature_set,
                 main_target=main_target,
-                num_aux_targets=0
+                num_aux_targets=len(aux_targets)  # Changed from 0 to len(aux_targets)
             )
             missing_targets = [t for t in aux_targets if t not in train_df.columns]
             if missing_targets:
