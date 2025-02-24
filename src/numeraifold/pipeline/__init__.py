@@ -10,7 +10,8 @@ from .configuration import (
 from .execution import (
     run_alphafold_pipeline,
     run_domains_only_pipeline,
-    extract_feature_domains_only
+    extract_feature_domains_only,
+    follow_up_domains_pipeline
 )
 
 __all__ = [
@@ -25,5 +26,6 @@ __all__ = [
     # Execution
     'run_alphafold_pipeline',
     'run_domains_only_pipeline',
-    'extract_feature_domains_only'
+    'extract_feature_domains_only',
+    'follow_up_domains_pipeline'
 ]
