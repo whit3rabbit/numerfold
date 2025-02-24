@@ -15,6 +15,7 @@ import traceback
 import umap
 import json
 import os
+import gc
 from lightgbm import LGBMRegressor
 import traceback
 from typing import Optional, Dict, List
@@ -885,7 +886,9 @@ def follow_up_domains_pipeline(
     feature_groups: dict,
     main_target: str,
     domain_score_threshold: float = 0.01,
-    correlation_threshold: float = 0.95
+    correlation_threshold: float = 0.95,
+    memory_efficient: bool = False,
+    batch_size: int = 100
 ):
     """
     Follow-up pipeline that:
@@ -901,35 +904,87 @@ def follow_up_domains_pipeline(
         main_target (str): Name of the target column in train_df/val_df.
         domain_score_threshold (float): Minimum correlation threshold to keep a domain.
         correlation_threshold (float): Threshold for feature correlation pruning.
+        memory_efficient (bool): If True, use memory efficient processing
+        batch_size (int): Number of features to process at once in memory-efficient mode
 
     Returns:
         dict: Contains domain_scores, kept_domains, final_model_score, pruned_features, etc.
     """
-
+    
     # -------------------------------------------------
     # 1. Evaluate domain performance using correlation
     # -------------------------------------------------
     print("Evaluating domain performance...")
     domain_scores = {}
-    for domain_name, feats in feature_groups.items():
-        # Handle empty or tiny feature groups
-        if len(feats) < 5:
-            print(f"  {domain_name}: Too few features ({len(feats)}), skipping")
-            domain_scores[domain_name] = 0.0
-            continue
-            
-        # Calculate mean absolute correlation with target
-        try:
-            # Convert both features and target to float32 for consistency
-            features_float = train_df[feats].astype('float32')
-            target_float = train_df[main_target].astype('float32')
-            
-            correlations = features_float.corrwith(target_float).abs()
-            mean_corr = correlations.mean()
-            domain_scores[domain_name] = float(mean_corr)
-        except Exception as e:
-            print(f"  Error evaluating {domain_name}: {e}")
-            domain_scores[domain_name] = 0.0
+    
+    # If memory_efficient is True, process domains in batches
+    if memory_efficient:
+        # Make sure target column is float32
+        target_series = train_df[main_target].astype('float32')
+        
+        for domain_name, feats in feature_groups.items():
+            # Handle empty or tiny feature groups
+            if len(feats) < 5:
+                print(f"  {domain_name}: Too few features ({len(feats)}), skipping")
+                domain_scores[domain_name] = 0.0
+                continue
+                
+            # Process features in batches
+            try:
+                correlations = []
+                for i in range(0, len(feats), batch_size):
+                    batch_feats = feats[i:i+batch_size]
+                    print(f"  {domain_name}: Processing batch {i//batch_size + 1}/{(len(feats)+batch_size-1)//batch_size} ({len(batch_feats)} features)")
+                    
+                    # Convert features to float32 and calculate correlation
+                    features_batch = train_df[batch_feats].astype('float32')
+                    batch_corrs = features_batch.corrwith(target_series).abs()
+                    correlations.extend(batch_corrs.tolist())
+                    
+                    # Clean up to free memory
+                    del features_batch
+                    del batch_corrs
+                    gc.collect()
+                
+                # Calculate mean correlation for the domain
+                mean_corr = sum(correlations) / len(correlations)
+                domain_scores[domain_name] = float(mean_corr)
+                
+                # Clean up
+                del correlations
+                gc.collect()
+                
+            except Exception as e:
+                print(f"  Error evaluating {domain_name}: {e}")
+                domain_scores[domain_name] = 0.0
+    else:
+        # Standard processing without memory optimization
+        for domain_name, feats in feature_groups.items():
+            # Handle empty or tiny feature groups
+            if len(feats) < 5:
+                print(f"  {domain_name}: Too few features ({len(feats)}), skipping")
+                domain_scores[domain_name] = 0.0
+                continue
+                
+            # Calculate mean absolute correlation with target
+            try:
+                # Convert both features and target to float32 for consistency
+                features_float = train_df[feats].astype('float32')
+                target_float = train_df[main_target].astype('float32')
+                
+                correlations = features_float.corrwith(target_float).abs()
+                mean_corr = correlations.mean()
+                domain_scores[domain_name] = float(mean_corr)
+                
+                # Clean up
+                del features_float
+                del target_float
+                del correlations
+                gc.collect()
+                
+            except Exception as e:
+                print(f"  Error evaluating {domain_name}: {e}")
+                domain_scores[domain_name] = 0.0
     
     print("Domain performance scores (correlation with target):")
     for d, s in domain_scores.items():
@@ -958,33 +1013,90 @@ def follow_up_domains_pipeline(
     # 3. Correlation pruning within kept features
     # -------------------------------------------------
     print(f"\nPruning correlated features (threshold={correlation_threshold})...")
-    try:
-        # Fit the selector on training data's kept features
-        selector = SmartCorrelatedSelection(
-            threshold=correlation_threshold, 
-            variables=kept_features,
-            method='pearson'
+    
+    # Choose pruning method based on memory efficiency setting
+    if memory_efficient and len(kept_features) > 1000:
+        print("Using memory-efficient correlation pruning...")
+        pruned_features = memory_efficient_feature_pruning(
+            train_df, kept_features, main_target, 
+            correlation_threshold=correlation_threshold, 
+            batch_size=batch_size
         )
-        # Only pass the required columns to avoid errors
-        columns_to_use = kept_features + [main_target]
-        
-        # Convert columns to float32 to avoid PyArrow type issues
-        train_subset = train_df[columns_to_use].copy().astype('float32')
-        train_pruned = selector.fit_transform(train_subset)
-        pruned_features = [f for f in train_pruned.columns if f != main_target]
-        
         print(f"Reduced from {len(kept_features)} to {len(pruned_features)} features after pruning")
-    except Exception as e:
-        print(f"Error in correlation pruning: {e}")
-        print("Falling back to original features")
-        # Convert to standard Python types in case of error
-        pruned_features = kept_features
+    else:
+        try:
+            # Fit the selector on training data's kept features
+            selector = SmartCorrelatedSelection(
+                threshold=correlation_threshold, 
+                variables=kept_features,
+                method='pearson'
+            )
+            # Only pass the required columns to avoid errors
+            columns_to_use = kept_features + [main_target]
+            
+            # Convert columns to float32 to avoid PyArrow type issues
+            train_subset = train_df[columns_to_use].copy().astype('float32')
+            train_pruned = selector.fit_transform(train_subset)
+            pruned_features = [f for f in train_pruned.columns if f != main_target]
+            
+            print(f"Reduced from {len(kept_features)} to {len(pruned_features)} features after pruning")
+            
+            # Clean up
+            del train_subset
+            del train_pruned
+            gc.collect()
+            
+        except Exception as e:
+            print(f"Error in correlation pruning: {e}")
+            print("Falling back to original features")
+            # Convert to standard Python types in case of error
+            pruned_features = kept_features
 
     # -------------------------------------------------
     # 4. Train a final global regression model on pruned features
     # -------------------------------------------------
     final_score = 0.0
     feature_importance = None
+    
+    # If we have a lot of features, use a subset for the model
+    if len(pruned_features) > 500:
+        print(f"\nToo many features for model training ({len(pruned_features)}). Using top 500 features by correlation.")
+        if memory_efficient:
+            # Use memory-efficient feature selection
+            feature_scores = []
+            target_series = train_df[main_target].astype('float32')
+            
+            for i in range(0, len(pruned_features), batch_size):
+                batch_feats = pruned_features[i:i+batch_size]
+                features_batch = train_df[batch_feats].astype('float32')
+                batch_corrs = features_batch.corrwith(target_series).abs()
+                
+                for feat, corr in zip(batch_feats, batch_corrs):
+                    feature_scores.append((feat, corr))
+                
+                # Clean up
+                del features_batch
+                del batch_corrs
+                gc.collect()
+                
+            # Sort by correlation and take top 500
+            sorted_features = sorted(feature_scores, key=lambda x: x[1], reverse=True)
+            pruned_features = [f[0] for f in sorted_features[:500]]
+            
+            # Clean up
+            del feature_scores
+            del sorted_features
+            gc.collect()
+        else:
+            # Standard method
+            feature_corrs = train_df[pruned_features].astype('float32').corrwith(train_df[main_target].astype('float32')).abs()
+            sorted_features = feature_corrs.sort_values(ascending=False)
+            pruned_features = sorted_features.index[:500].tolist()
+            
+            # Clean up
+            del feature_corrs
+            del sorted_features
+            gc.collect()
     
     print("\nTraining final global regression model with pruned features...")
     try:
@@ -1033,6 +1145,10 @@ def follow_up_domains_pipeline(
             'importance': final_model.feature_importances_
         }).sort_values('importance', ascending=False)
         
+        # Clean up to free memory
+        del X_train, y_train, X_val, y_val
+        gc.collect()
+        
     except Exception as e:
         print(f"Error in final model training: {e}")
         print("Returning partial results without final model")
@@ -1057,6 +1173,85 @@ def follow_up_domains_pipeline(
         'feature_importance': feature_importance_dict
     }
     return results
+
+def memory_efficient_feature_pruning(df, features, target_col, correlation_threshold=0.95, batch_size=100):
+    """
+    Memory-efficient implementation of correlation pruning.
+    
+    Args:
+        df: DataFrame with features
+        features: List of feature names
+        target_col: Target column name
+        correlation_threshold: Threshold for pruning
+        batch_size: Number of features to process at once
+        
+    Returns:
+        list: Pruned feature list
+    """
+    
+    print(f"Starting memory-efficient feature pruning with {len(features)} features")
+    print(f"Processing in batches of {batch_size} features")
+    
+    # Track the features to keep
+    kept_features = []
+    
+    # Process features in batches
+    for start_idx in range(0, len(features), batch_size):
+        batch_features = features[start_idx:start_idx+batch_size]
+        print(f"Processing batch {start_idx//batch_size + 1}/{(len(features)+batch_size-1)//batch_size} ({len(batch_features)} features)")
+        
+        # Create a correlation matrix for this batch vs all kept features
+        if kept_features:
+            # Calculate correlations between this batch and the kept features
+            current_batch = df[batch_features].astype('float32')
+            kept_batch = df[kept_features].astype('float32')
+            
+            # Calculate correlations chunk by chunk
+            all_corrs = []
+            for i in range(0, len(kept_features), batch_size):
+                chunk_feats = kept_features[i:i+batch_size]
+                chunk_df = df[chunk_feats].astype('float32')
+                
+                for feat in batch_features:
+                    corrs = []
+                    for kept_feat in chunk_feats:
+                        corr = np.corrcoef(df[feat].astype('float32'), df[kept_feat].astype('float32'))[0, 1]
+                        corrs.append(abs(corr))
+                    all_corrs.append((feat, max(corrs)))
+                
+                # Clean up
+                del chunk_df
+                gc.collect()
+            
+            # Add features with correlation below threshold
+            for feat, max_corr in all_corrs:
+                if max_corr < correlation_threshold:
+                    kept_features.append(feat)
+            
+            # Clean up
+            del current_batch
+            del kept_batch
+            del all_corrs
+            gc.collect()
+        else:
+            # For the first batch, keep the first feature and compare others to it
+            if batch_features:
+                kept_features.append(batch_features[0])
+                
+                # Compare remaining features in first batch
+                for feat in batch_features[1:]:
+                    max_corr = 0
+                    for kept_feat in kept_features:
+                        corr = np.corrcoef(df[feat].astype('float32'), df[kept_feat].astype('float32'))[0, 1]
+                        max_corr = max(max_corr, abs(corr))
+                    
+                    if max_corr < correlation_threshold:
+                        kept_features.append(feat)
+        
+        print(f"Kept {len(kept_features)} features so far")
+    
+    print(f"Finished pruning. Reduced from {len(features)} to {len(kept_features)} features")
+    return kept_features
 
 def extract_feature_domains_only(train_df, features, n_clusters=10,
                                  random_seed=42, save_path='feature_domains_data.csv'):

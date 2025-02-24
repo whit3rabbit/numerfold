@@ -5,7 +5,6 @@ This module provides functions to load and process data for a machine learning p
 It includes functions to download datasets if missing, load data with memory-efficient
 settings, process data in batches for model inference, and create properly formatted model inputs.
 """
-
 import os
 import json
 import pandas as pd
@@ -14,11 +13,12 @@ import torch
 from tqdm import tqdm
 import pyarrow.parquet as pq
 from numerapi import NumerAPI
+import gc
 
 
 def load_data(data_version="v5.0", feature_set="small",
               main_target="target", aux_targets=None, num_aux_targets=5,
-              convert_dtypes=True):
+              convert_dtypes=True, chunk_size=None, max_rows=None):
     """
     Load data with memory-efficient settings and robust target handling.
     
@@ -29,6 +29,8 @@ def load_data(data_version="v5.0", feature_set="small",
         aux_targets (list): Optional list of specific auxiliary targets to include
         num_aux_targets (int): Number of random auxiliary targets to include if aux_targets not specified
         convert_dtypes (bool): If True, converts PyArrow dtypes to standard Python/NumPy types
+        chunk_size (int): If provided, process data in chunks of this size to save memory
+        max_rows (int): If provided, limit the number of rows loaded
     
     Returns:
         tuple: (train_df, val_df, features, all_targets)
@@ -84,45 +86,146 @@ def load_data(data_version="v5.0", feature_set="small",
     columns_to_load = ["era"] + features + final_targets
     print(f"Reading train data with {len(features)} features and {len(final_targets)} targets...")
     
-    # First load with pyarrow backend for memory efficiency
-    train_df = pd.read_parquet(
-        f"{data_version}/train.parquet",
-        columns=columns_to_load,
-        dtype_backend='pyarrow'
-    )
-    
-    print("Reading validation data...")
-    val_df = pd.read_parquet(
-        f"{data_version}/validation.parquet",
-        columns=columns_to_load,
-        dtype_backend='pyarrow'
-    )
-    
-    # Convert PyArrow types to standard Python types if requested
-    if convert_dtypes:
-        print("Converting PyArrow dtypes to standard NumPy dtypes...")
+    # If chunk processing is enabled, use it
+    if chunk_size is not None:
+        print(f"Loading and processing data in chunks of {chunk_size} rows")
+        train_df = load_data_in_chunks(
+            filepath=f"{data_version}/train.parquet",
+            columns=columns_to_load,
+            chunk_size=chunk_size,
+            max_rows=max_rows,
+            convert_dtypes=convert_dtypes
+        )
         
-        # Function to safely convert a dataframe's numeric columns to float32
-        def convert_numeric_to_float32(df):
-            for col in df.columns:
-                # Skip non-feature columns like 'era'
-                if col == 'era':
-                    continue
-                    
-                # Check if column is numeric
-                try:
-                    # Convert PyArrow types to standard float32
-                    if pd.api.types.is_numeric_dtype(df[col]):
-                        df[col] = df[col].astype('float32')
-                except Exception as e:
-                    print(f"Warning: Couldn't convert column {col}: {e}")
-            return df
+        print("Reading validation data in chunks...")
+        val_df = load_data_in_chunks(
+            filepath=f"{data_version}/validation.parquet",
+            columns=columns_to_load,
+            chunk_size=chunk_size,
+            max_rows=max_rows,
+            convert_dtypes=convert_dtypes
+        )
+    else:
+        # First load with pyarrow backend for memory efficiency
+        train_df = pd.read_parquet(
+            f"{data_version}/train.parquet",
+            columns=columns_to_load,
+            dtype_backend='pyarrow'
+        )
+        
+        # Limit rows if specified
+        if max_rows is not None and max_rows < len(train_df):
+            print(f"Limiting training data to {max_rows} rows")
+            train_df = train_df.head(max_rows)
+        
+        print("Reading validation data...")
+        val_df = pd.read_parquet(
+            f"{data_version}/validation.parquet",
+            columns=columns_to_load,
+            dtype_backend='pyarrow'
+        )
+        
+        # Limit validation rows if specified
+        if max_rows is not None and max_rows < len(val_df):
+            print(f"Limiting validation data to {max_rows} rows")
+            val_df = val_df.head(max_rows)
+        
+        # Convert PyArrow types to standard Python types if requested
+        if convert_dtypes:
+            print("Converting PyArrow dtypes to standard NumPy dtypes...")
             
-        train_df = convert_numeric_to_float32(train_df)
-        val_df = convert_numeric_to_float32(val_df)
+            # Function to safely convert a dataframe's numeric columns to float32
+            def convert_numeric_to_float32(df):
+                df_copy = df.copy()
+                gc.collect()  # Collect garbage to free memory
+                
+                for col in df.columns:
+                    # Skip non-feature columns like 'era'
+                    if col == 'era':
+                        continue
+                        
+                    # Check if column is numeric
+                    try:
+                        # Convert PyArrow types to standard float32
+                        if pd.api.types.is_numeric_dtype(df[col]):
+                            df_copy[col] = df[col].astype('float32')
+                            # Release memory from original column
+                            del df[col]
+                            gc.collect()
+                    except Exception as e:
+                        print(f"Warning: Couldn't convert column {col}: {e}")
+                return df_copy
+                
+            train_df = convert_numeric_to_float32(train_df)
+            val_df = convert_numeric_to_float32(val_df)
     
     print(f"Train shape: {train_df.shape}, Validation shape: {val_df.shape}")
     return train_df, val_df, features, final_targets
+
+
+def load_data_in_chunks(filepath, columns, chunk_size=10000, max_rows=None, convert_dtypes=True):
+    """
+    Load parquet data in chunks to manage memory usage.
+    
+    Parameters:
+        filepath (str): Path to the parquet file
+        columns (list): List of columns to load
+        chunk_size (int): Number of rows per chunk
+        max_rows (int): Maximum number of rows to load (None for all)
+        convert_dtypes (bool): Whether to convert PyArrow types to standard types
+    
+    Returns:
+        pd.DataFrame: Combined dataframe from all chunks
+    """   
+    # Get total number of rows
+    parquet_file = pq.ParquetFile(filepath)
+    total_rows = parquet_file.metadata.num_rows
+    
+    # Determine number of rows to load
+    if max_rows is not None:
+        total_rows = min(total_rows, max_rows)
+    
+    # Calculate number of chunks
+    num_chunks = (total_rows + chunk_size - 1) // chunk_size
+    print(f"Loading {total_rows} rows in {num_chunks} chunks")
+    
+    # Load data in chunks
+    chunks = []
+    for i in range(num_chunks):
+        start_row = i * chunk_size
+        # Don't exceed max_rows or total number of rows
+        rows_to_read = min(chunk_size, total_rows - start_row)
+        
+        print(f"Loading chunk {i+1}/{num_chunks} (rows {start_row} to {start_row + rows_to_read})")
+        chunk = pd.read_parquet(
+            filepath,
+            columns=columns,
+            dtype_backend='pyarrow',
+            offset=start_row,
+            rows=rows_to_read
+        )
+        
+        # Convert types if requested
+        if convert_dtypes:
+            print(f"Converting chunk {i+1} data types...")
+            for col in chunk.columns:
+                if col != 'era' and pd.api.types.is_numeric_dtype(chunk[col]):
+                    chunk[col] = chunk[col].astype('float32')
+            
+        chunks.append(chunk)
+        
+        # Force garbage collection to free memory
+        gc.collect()
+    
+    # Combine chunks
+    print("Combining chunks...")
+    result = pd.concat(chunks, ignore_index=True)
+    
+    # Clear chunks to free memory
+    chunks.clear()
+    gc.collect()
+    
+    return result
 
 def process_in_batches(df, model, features, device='cuda' if torch.cuda.is_available() else 'cpu'):
     """
