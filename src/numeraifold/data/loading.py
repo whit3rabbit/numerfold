@@ -187,6 +187,7 @@ def load_data_in_chunks(filepath, columns, chunk_size=10000, max_rows=None, conv
                         table.column_names.index(col),
                         col,
                         table[col].cast(pa.float32())
+                    )
         
         df = table.to_pandas()
         chunks.append(df.iloc[:chunk_size])
