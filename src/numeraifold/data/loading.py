@@ -17,7 +17,8 @@ from numerapi import NumerAPI
 
 
 def load_data(data_version="v5.0", feature_set="small",
-              main_target="target", aux_targets=None, num_aux_targets=5):
+              main_target="target", aux_targets=None, num_aux_targets=5,
+              convert_dtypes=True):
     """
     Load data with memory-efficient settings and robust target handling.
     
@@ -27,6 +28,7 @@ def load_data(data_version="v5.0", feature_set="small",
         main_target (str): Primary target column name
         aux_targets (list): Optional list of specific auxiliary targets to include
         num_aux_targets (int): Number of random auxiliary targets to include if aux_targets not specified
+        convert_dtypes (bool): If True, converts PyArrow dtypes to standard Python/NumPy types
     
     Returns:
         tuple: (train_df, val_df, features, all_targets)
@@ -82,6 +84,7 @@ def load_data(data_version="v5.0", feature_set="small",
     columns_to_load = ["era"] + features + final_targets
     print(f"Reading train data with {len(features)} features and {len(final_targets)} targets...")
     
+    # First load with pyarrow backend for memory efficiency
     train_df = pd.read_parquet(
         f"{data_version}/train.parquet",
         columns=columns_to_load,
@@ -94,6 +97,29 @@ def load_data(data_version="v5.0", feature_set="small",
         columns=columns_to_load,
         dtype_backend='pyarrow'
     )
+    
+    # Convert PyArrow types to standard Python types if requested
+    if convert_dtypes:
+        print("Converting PyArrow dtypes to standard NumPy dtypes...")
+        
+        # Function to safely convert a dataframe's numeric columns to float32
+        def convert_numeric_to_float32(df):
+            for col in df.columns:
+                # Skip non-feature columns like 'era'
+                if col == 'era':
+                    continue
+                    
+                # Check if column is numeric
+                try:
+                    # Convert PyArrow types to standard float32
+                    if pd.api.types.is_numeric_dtype(df[col]):
+                        df[col] = df[col].astype('float32')
+                except Exception as e:
+                    print(f"Warning: Couldn't convert column {col}: {e}")
+            return df
+            
+        train_df = convert_numeric_to_float32(train_df)
+        val_df = convert_numeric_to_float32(val_df)
     
     print(f"Train shape: {train_df.shape}, Validation shape: {val_df.shape}")
     return train_df, val_df, features, final_targets

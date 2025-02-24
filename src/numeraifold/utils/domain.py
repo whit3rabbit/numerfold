@@ -2,7 +2,82 @@ import numpy as np
 import pandas as pd
 import os
 from numeraifold.utils.artifacts import load_and_analyze_domains
+import os
+import pickle
+import json
 
+def save_model_and_domains(model, feature_groups, domain_scores, pruned_features, save_dir='./saved_models'):
+    """
+    Save the trained model and domain data for future use.
+    
+    Args:
+        model: The trained model to save
+        feature_groups: Dictionary of feature groups
+        domain_scores: Dictionary of domain scores
+        pruned_features: List of pruned features
+        save_dir: Directory to save the model and data
+    
+    Returns:
+        dict: Dictionary with paths to saved files
+    """
+   
+    # Create directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    saved_paths = {}
+    
+    # Save the model using pickle
+    if model is not None:
+        model_path = os.path.join(save_dir, 'model.pkl')
+        with open(model_path, 'wb') as f:
+            pickle.dump(model, f)
+        saved_paths['model_path'] = model_path
+    
+    # Save domain data as JSON
+    domain_data = {
+        'feature_groups': {k: list(v) for k, v in feature_groups.items()},  # Convert to lists
+        'domain_scores': domain_scores,
+        'pruned_features': list(pruned_features)  # Convert to list
+    }
+    
+    domain_path = os.path.join(save_dir, 'domains.json')
+    with open(domain_path, 'w') as f:
+        json.dump(domain_data, f, indent=2)
+    saved_paths['domain_path'] = domain_path
+    
+    print(f"Model and domain data saved to {save_dir}")
+    return saved_paths
+
+def load_model_and_domains(load_dir='./saved_models'):
+    """
+    Load the saved model and domain data.
+    
+    Args:
+        load_dir: Directory where model and data are saved
+    
+    Returns:
+        dict: Dictionary with loaded model and domain data
+    """
+   
+    loaded_data = {}
+    
+    # Load the model
+    model_path = os.path.join(load_dir, 'model.pkl')
+    if os.path.exists(model_path):
+        with open(model_path, 'rb') as f:
+            loaded_data['model'] = pickle.load(f)
+    
+    # Load domain data
+    domain_path = os.path.join(load_dir, 'domains.json')
+    if os.path.exists(domain_path):
+        with open(domain_path, 'r') as f:
+            domain_data = json.load(f)
+            loaded_data['feature_groups'] = domain_data.get('feature_groups', {})
+            loaded_data['domain_scores'] = domain_data.get('domain_scores', {})
+            loaded_data['pruned_features'] = domain_data.get('pruned_features', [])
+    
+    print(f"Model and domain data loaded from {load_dir}")
+    return loaded_data
 
 def integrate_domain_data_to_pipeline(run_alphafold_pipeline, domains_csv_path='feature_domains_data.csv'):
     """

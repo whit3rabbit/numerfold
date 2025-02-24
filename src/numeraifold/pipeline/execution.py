@@ -13,6 +13,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import traceback
 import umap
+import json
 import os
 from lightgbm import LGBMRegressor
 import traceback
@@ -49,6 +50,12 @@ from numeraifold.features.stability import calculate_feature_stability
 # Utilities for saving/loading artifacts
 from numeraifold.utils.artifacts import save_model_artifacts, save_feature_domains_data, load_and_analyze_domains
 
+# Serialize domain results
+from numeraifold.utils.serialize import make_json_serializable, save_results_to_json
+
+# Load/save domain models
+from numeraifold.utils.domain import save_model_and_domains, load_model_and_domains
+
 # Logging
 from numeraifold.utils.logging import log_memory_usage
 
@@ -65,7 +72,7 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
                            num_layers=4, num_heads=8, random_seed=RANDOM_SEED,
                            save_domains=True, domains_save_path='feature_domains_data.csv',
                            force_phase1=False, base_path='.', save_model=True,
-                           skip_phase1=False):
+                           skip_phase1=False, reuse_model=False, model_path=None):
     """
     Run the complete AlphaFold-inspired pipeline for Numerai.
 
@@ -88,6 +95,8 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
         base_path (str): Base path for saving artifacts.
         save_model (bool): Whether to save the trained model.
         skip_phase1 (bool): If True, skip Phase 1 and load cached domain data.
+        reuse_model (bool): If True, try to load a previously saved model.
+        model_path (str): Path to the saved model directory.
 
     Returns:
         dict: Results dictionary containing domain data, trained model, evaluation metrics, etc.
@@ -99,16 +108,80 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
     torch.manual_seed(random_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(random_seed)
+        torch.cuda.manual_seed_all(random_seed)
 
     results = {}
     embedding = None
     cluster_labels = None
     feature_groups = None
+    trained_model = None
+    model_loaded = False
 
     try:
+        # First check if we should reuse a previously saved model
+        if reuse_model and model_path is not None:
+            print(f"Attempting to load saved model from {model_path}")
+            try:
+                loaded_data = load_model_and_domains(model_path)
+                if 'model' in loaded_data and loaded_data['model'] is not None:
+                    print("Successfully loaded model")
+                    trained_model = loaded_data['model']
+                    model_loaded = True
+                    results['trained_model'] = trained_model
+                    results['model_loaded'] = True
+                    
+                    # If we have feature groups, load those too
+                    if 'feature_groups' in loaded_data and loaded_data['feature_groups']:
+                        feature_groups = loaded_data['feature_groups']
+                        results['feature_groups'] = feature_groups
+                        print(f"Loaded {len(feature_groups)} feature groups")
+                        
+                        # If we loaded feature groups, we can skip Phase 1
+                        skip_phase1 = True
+                    
+                    # If we have pruned features, use those
+                    if 'pruned_features' in loaded_data and loaded_data['pruned_features']:
+                        pruned_features = loaded_data['pruned_features']
+                        results['pruned_features'] = pruned_features
+                        print(f"Loaded {len(pruned_features)} pruned features")
+                        
+                        # Use these as our features going forward
+                        features = [f for f in pruned_features if f in train_df.columns and f in val_df.columns]
+                        print(f"Using {len(features)} loaded features")
+            except Exception as e:
+                print(f"Error loading model: {e}")
+                print("Will train new model instead")
+
+        # Convert PyArrow types in train_df and val_df to standard types
+        print("Converting data types to ensure compatibility...")
+        # Helper function to convert numeric columns to float32
+        def convert_numeric_to_float32(df, cols_to_convert):
+            for col in cols_to_convert:
+                if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+                    df[col] = df[col].astype('float32')
+            return df
+            
+        # Convert features in both dataframes
+        train_df = convert_numeric_to_float32(train_df, features)
+        val_df = convert_numeric_to_float32(val_df, features)
+        
+        # Convert target columns
+        if isinstance(targets, list):
+            train_df = convert_numeric_to_float32(train_df, targets)
+            val_df = convert_numeric_to_float32(val_df, targets)
+        else:
+            if targets in train_df.columns:
+                train_df[targets] = train_df[targets].astype('float32')
+            if targets in val_df.columns:
+                val_df[targets] = val_df[targets].astype('float32')
+
         # ----- Phase 1: Feature Domain Identification -----
         print("----- Phase 1: Feature Domain Identification -----")
-        if skip_phase1:
+        if force_phase1:
+            print("Force Phase 1 enabled. Running domain identification regardless of cached data.")
+            skip_phase1 = False
+            
+        if skip_phase1 and not force_phase1:
             print(f"Skipping Phase 1. Loading domain data from: {domains_save_path}")
             # Use the utility to load domain data
             phase1_data = load_and_analyze_domains(domains_save_path)
@@ -217,9 +290,22 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
                 val_df=val_df,
                 feature_groups=feature_groups,
                 main_target="target",
-                domain_score_threshold=0.51,   # You can adjust this threshold
-                correlation_threshold=0.95       # Adjust pruning threshold if needed
+                domain_score_threshold=0.01,
+                correlation_threshold=0.95
             )
+            
+            # Make the followup results JSON serializable
+            followup_results = make_json_serializable(followup_results)
+            results['followup_results'] = followup_results
+            
+            # Save followup results to a separate file for inspection
+            try:
+                with open('followup_results.json', 'w') as f:
+                    json.dump(followup_results, f, indent=4)
+                print("Follow-up results saved to followup_results.json")
+            except Exception as e:
+                print(f"Warning: Failed to save followup results: {e}")
+                
             refined_features = followup_results.get('pruned_features', features)
             print(f"Refined features count: {len(refined_features)}")
 
@@ -232,43 +318,39 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
         # ----- Phase 2: Model Architecture -----
         print("----- Phase 2: Model Architecture -----")
 
-        # Validate features exist in both train and validation sets
-        valid_features = [f for f in features if f in train_df.columns and f in val_df.columns]
-        if len(valid_features) < len(features):
-            print(f"Warning: {len(features) - len(valid_features)} features not found in both train and val datasets")
-            features = valid_features
+        # Skip model creation if we loaded one successfully
+        if not model_loaded:
+            # Validate features exist in both train and validation sets
+            valid_features = [f for f in features if f in train_df.columns and f in val_df.columns]
+            if len(valid_features) < len(features):
+                print(f"Warning: {len(features) - len(valid_features)} features not found in both train and val datasets")
+                features = valid_features
 
-        if not features:
-            raise ValueError("No valid features for model training")
+            if not features:
+                raise ValueError("No valid features for model training")
 
-        # Instantiate the NumerAIFold model with the specified architecture
-        model = NumerAIFold(
-            num_features=len(features),
-            num_layers=num_layers,
-            embed_dim=embed_dim,
-            num_heads=num_heads
-        )
-        results['model_config'] = {
-            'num_features': len(features),
-            'num_layers': num_layers,
-            'embed_dim': embed_dim,
-            'num_heads': num_heads
-        }
+            # Instantiate the NumerAIFold model with the specified architecture
+            model = NumerAIFold(
+                num_features=len(features),
+                num_layers=num_layers,
+                embed_dim=embed_dim,
+                num_heads=num_heads
+            )
+            results['model_config'] = {
+                'num_features': len(features),
+                'num_layers': num_layers,
+                'embed_dim': embed_dim,
+                'num_heads': num_heads
+            }
 
-        # Prepare data loaders with error handling
-        try:
-            # If a custom dataloader function exists in the global scope, use it
-            if 'get_dataloaders' in globals() and callable(globals()['get_dataloaders']):
-                train_loader, val_loader = get_dataloaders(
-                    train_df, val_df, features, targets, batch_size=batch_size
-                )
-            else:
-                # Fallback to manual dataloader creation
-                X_train = np.array(train_df[features].fillna(0).values, dtype=np.float32)
-                X_val = np.array(val_df[features].fillna(0).values, dtype=np.float32)
+            # Prepare data loaders with error handling
+            try:
+                # Convert data to float32 to avoid PyArrow type issues
+                X_train = np.array(train_df[features].fillna(0).astype('float32').values, dtype=np.float32)
+                X_val = np.array(val_df[features].fillna(0).astype('float32').values, dtype=np.float32)
 
-                y_train = np.array(train_df[targets[0]].fillna(0).values, dtype=np.float32).reshape(-1, 1)
-                y_val = np.array(val_df[targets[0]].fillna(0).values, dtype=np.float32).reshape(-1, 1)
+                y_train = np.array(train_df[targets[0]].fillna(0).astype('float32').values, dtype=np.float32).reshape(-1, 1)
+                y_val = np.array(val_df[targets[0]].fillna(0).astype('float32').values, dtype=np.float32).reshape(-1, 1)
 
                 # Convert to tensors
                 X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
@@ -282,83 +364,123 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
 
                 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
                 val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-        except Exception as e:
-            print(f"Error in dataloader creation: {e}")
-            print("Attempting to create simpler dataloaders...")
+            except Exception as e:
+                print(f"Error in dataloader creation: {e}")
+                print("Attempting to create simpler dataloaders...")
+                try:
+                    # Try again with explicit float conversion for safety
+                    X_train_np = np.array(train_df[features].fillna(0).astype('float32').values, dtype=np.float32)
+                    y_train_np = np.array(train_df[targets[0]].fillna(0).astype('float32').values, dtype=np.float32).reshape(-1, 1)
+                    X_val_np = np.array(val_df[features].fillna(0).astype('float32').values, dtype=np.float32)
+                    y_val_np = np.array(val_df[targets[0]].fillna(0).astype('float32').values, dtype=np.float32).reshape(-1, 1)
+
+                    X_train = torch.tensor(X_train_np, dtype=torch.float32)
+                    y_train = torch.tensor(y_train_np, dtype=torch.float32)
+                    X_val = torch.tensor(X_val_np, dtype=torch.float32)
+                    y_val = torch.tensor(y_val_np, dtype=torch.float32)
+
+                    train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
+                    val_dataset = torch.utils.data.TensorDataset(X_val, y_val)
+
+                    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+                    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+                except Exception as e2:
+                    print(f"Fallback dataloader creation also failed: {e2}")
+                    print("Creating minimal emergency dataloaders")
+                    feature = features[0]
+                    X_train_min = torch.tensor(train_df[feature].fillna(0).astype('float32').values, dtype=torch.float32).view(-1, 1)
+                    y_train_min = torch.tensor(train_df[targets[0]].fillna(0).astype('float32').values, dtype=torch.float32).view(-1, 1)
+                    X_val_min = torch.tensor(val_df[feature].fillna(0).astype('float32').values, dtype=torch.float32).view(-1, 1)
+                    y_val_min = torch.tensor(val_df[targets[0]].fillna(0).astype('float32').values, dtype=torch.float32).view(-1, 1)
+
+                    train_dataset = torch.utils.data.TensorDataset(X_train_min, y_train_min)
+                    val_dataset = torch.utils.data.TensorDataset(X_val_min, y_val_min)
+
+                    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+                    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+            # ----- Model Training -----
             try:
-                X_train_np = np.array(train_df[features].fillna(0).values, dtype=np.float32)
-                y_train_np = np.array(train_df[targets[0]].fillna(0).values, dtype=np.float32).reshape(-1, 1)
-                X_val_np = np.array(val_df[features].fillna(0).values, dtype=np.float32)
-                y_val_np = np.array(val_df[targets[0]].fillna(0).values, dtype=np.float32).reshape(-1, 1)
-
-                X_train = torch.tensor(X_train_np, dtype=torch.float32)
-                y_train = torch.tensor(y_train_np, dtype=torch.float32)
-                X_val = torch.tensor(X_val_np, dtype=torch.float32)
-                y_val = torch.tensor(y_val_np, dtype=torch.float32)
-
-                train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
-                val_dataset = torch.utils.data.TensorDataset(X_val, y_val)
-
-                train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-                val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-            except Exception as e2:
-                print(f"Fallback dataloader creation also failed: {e2}")
-                print("Creating minimal emergency dataloaders")
-                feature = features[0]
-                X_train_min = torch.tensor(train_df[feature].fillna(0).values, dtype=torch.float32).view(-1, 1)
-                y_train_min = torch.tensor(train_df[targets[0]].fillna(0).values, dtype=torch.float32).view(-1, 1)
-                X_val_min = torch.tensor(val_df[feature].fillna(0).values, dtype=torch.float32).view(-1, 1)
-                y_val_min = torch.tensor(val_df[targets[0]].fillna(0).values, dtype=torch.float32).view(-1, 1)
-
-                train_dataset = torch.utils.data.TensorDataset(X_train_min, y_train_min)
-                val_dataset = torch.utils.data.TensorDataset(X_val_min, y_val_min)
-
-                train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-                val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
-        # ----- Model Training -----
-        try:
-            print(f"Training model on {len(features)} features for {epochs} epochs...")
-            trained_model = train_numeraifold_model(model, train_loader, val_loader, epochs=epochs)
-            results['trained_model'] = trained_model
-        except Exception as e:
-            print(f"Error in model training: {e}")
-            print("Attempting to train a simpler model...")
-            simple_model = NumerAIFold(
-                num_features=len(features),
-                num_layers=2,    # Fewer layers
-                embed_dim=64,    # Smaller embeddings
-                num_heads=4      # Fewer attention heads
-            )
-            try:
-                trained_model = train_numeraifold_model(simple_model, train_loader, val_loader, epochs=max(3, epochs // 2))
+                print(f"Training model on {len(features)} features for {epochs} epochs...")
+                trained_model = train_numeraifold_model(model, train_loader, val_loader, epochs=epochs)
                 results['trained_model'] = trained_model
-            except Exception as e2:
-                print(f"Error training simpler model: {e2}")
-                print("Skipping model training step")
-                results['trained_model'] = None
-                # Create a baseline model for subsequent steps
-                baseline_model = NumerAIFold(
+            except Exception as e:
+                print(f"Error in model training: {e}")
+                print("Attempting to train a simpler model...")
+                simple_model = NumerAIFold(
                     num_features=len(features),
-                    num_layers=1,
-                    embed_dim=32,
-                    num_heads=2
+                    num_layers=2,    # Fewer layers
+                    embed_dim=64,    # Smaller embeddings
+                    num_heads=4      # Fewer attention heads
                 )
-                baseline_model.eval()
-                trained_model = baseline_model
+                try:
+                    trained_model = train_numeraifold_model(simple_model, train_loader, val_loader, epochs=max(3, epochs // 2))
+                    results['trained_model'] = trained_model
+                except Exception as e2:
+                    print(f"Error training simpler model: {e2}")
+                    print("Skipping model training step")
+                    results['trained_model'] = None
+                    # Create a baseline model for subsequent steps
+                    baseline_model = NumerAIFold(
+                        num_features=len(features),
+                        num_layers=1,
+                        embed_dim=32,
+                        num_heads=2
+                    )
+                    baseline_model.eval()
+                    trained_model = baseline_model
+        else:
+            print("Using loaded model, skipping training")
+            
+        # Save the model and domain data if requested
+        if save_model and 'trained_model' in results and results['trained_model'] is not None:
+            model_save_dir = os.path.join(base_path, 'saved_models')
+            try:
+                # Get domain scores from followup results if available
+                domain_scores = {}
+                if 'followup_results' in results and 'domain_scores' in results['followup_results']:
+                    domain_scores = results['followup_results']['domain_scores']
+                
+                # Get pruned features if available
+                pruned_features = features
+                if 'followup_results' in results and 'pruned_features' in results['followup_results']:
+                    pruned_features = results['followup_results']['pruned_features']
+                
+                saved_paths = save_model_and_domains(
+                    model=results['trained_model'],
+                    feature_groups=feature_groups,
+                    domain_scores=domain_scores,
+                    pruned_features=pruned_features,
+                    save_dir=model_save_dir
+                )
+                results['saved_model_paths'] = saved_paths
+                print(f"Model and data saved to {model_save_dir}")
+            except Exception as e:
+                print(f"Error saving model: {e}")
 
         # If only domain data is needed and no model is trained, exit early
-        if results.get('domains_saved_path') and not trained_model:
+        if results.get('domains_saved_path') and 'trained_model' not in results:
             print("Domain data saved. Skipping remaining steps as requested.")
             return results
 
-        # ----- Phase 3: Feature Generation -----
+# ----- Phase 3: Feature Generation -----
         print("----- Phase 3: Feature Generation -----")
         if trained_model is not None:
             try:
                 print("Generating AlphaFold-inspired features...")
+                # Make sure to convert types before passing to generate_alphafold_features
+                train_df_float = train_df.copy()
+                val_df_float = val_df.copy()
+                
+                # Convert feature columns to float32
+                for col in features:
+                    if col in train_df_float.columns and pd.api.types.is_numeric_dtype(train_df_float[col]):
+                        train_df_float[col] = train_df_float[col].astype('float32')
+                    if col in val_df_float.columns and pd.api.types.is_numeric_dtype(val_df_float[col]):
+                        val_df_float[col] = val_df_float[col].astype('float32')
+                
                 train_features_df, val_features_df = generate_alphafold_features(
-                    train_df, val_df, trained_model, features,
+                    train_df_float, val_df_float, trained_model, features,
                     confidence_threshold=confidence_threshold
                 )
                 if train_features_df is not None and val_features_df is not None:
@@ -377,20 +499,22 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
                 val_enhanced = val_df.copy()
                 # Add dummy columns to maintain pipeline compatibility
                 train_enhanced['af_confidence'] = 0.5
-                train_enhanced['prediction'] = train_enhanced[targets[0]].mean()
+                target_col = targets[0] if isinstance(targets, list) else targets
+                train_enhanced['prediction'] = train_enhanced[target_col].astype('float32').mean()
                 train_enhanced['af_high_confidence'] = 0
                 val_enhanced['af_confidence'] = 0.5
-                val_enhanced['prediction'] = val_enhanced[targets[0]].mean()
+                val_enhanced['prediction'] = val_enhanced[target_col].astype('float32').mean()
                 val_enhanced['af_high_confidence'] = 0
         else:
             print("Skipping feature generation due to model training failure")
             train_enhanced = train_df.copy()
             val_enhanced = val_df.copy()
+            target_col = targets[0] if isinstance(targets, list) else targets
             train_enhanced['af_confidence'] = 0.5
-            train_enhanced['prediction'] = train_enhanced[targets[0]].mean()
+            train_enhanced['prediction'] = train_enhanced[target_col].astype('float32').mean()
             train_enhanced['af_high_confidence'] = 0
             val_enhanced['af_confidence'] = 0.5
-            val_enhanced['prediction'] = val_enhanced[targets[0]].mean()
+            val_enhanced['prediction'] = val_enhanced[target_col].astype('float32').mean()
             val_enhanced['af_high_confidence'] = 0
 
         # ----- Phase 4: Final Evaluation -----
@@ -419,9 +543,15 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
             print(f"Final feature set contains {len(all_features)} features")
             print("Running final model evaluation...")
 
+            # Convert all feature columns to float32 for evaluation
+            val_enhanced_float = val_enhanced.copy()
+            for col in all_features:
+                if col in val_enhanced_float.columns and pd.api.types.is_numeric_dtype(val_enhanced_float[col]):
+                    val_enhanced_float[col] = val_enhanced_float[col].astype('float32')
+
             # Run evaluation on the final model
             eval_results = run_final_evaluation(
-                val_df=val_enhanced,
+                val_df=val_enhanced_float,
                 model=trained_model,
                 val_loader=val_loader,
                 targets=targets,
@@ -430,6 +560,8 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
             )
 
             if eval_results is not None:
+                # Make evaluation results JSON serializable
+                eval_results = make_json_serializable(eval_results)
                 results['evaluation'] = eval_results
                 if 'val_df' in eval_results:
                     val_enhanced = eval_results['val_df']
@@ -459,12 +591,17 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
         except Exception as e:
             print(f"Error in final model evaluation: {e}")
             print("Using baseline predictions")
-            val_enhanced['prediction'] = val_enhanced[targets[0]].mean()
-            val_enhanced['prediction_weighted'] = val_enhanced[targets[0]].mean()
-            results['feature_importance'] = pd.DataFrame({
+            target_col = targets[0] if isinstance(targets, list) else targets
+            val_enhanced['prediction'] = val_enhanced[target_col].astype('float32').mean()
+            val_enhanced['prediction_weighted'] = val_enhanced[target_col].astype('float32').mean()
+            
+            # Create a serializable feature importance dataframe
+            feature_importance_dict = {
                 'feature': features[:min(10, len(features))],
                 'importance': [1.0 / min(10, len(features))] * min(10, len(features))
-            })
+            }
+            results['feature_importance'] = feature_importance_dict
+            
             default_metrics = {
                 'mean_correlation': 0,
                 'std_correlation': 1e-10,
@@ -747,7 +884,7 @@ def follow_up_domains_pipeline(
     val_df: pd.DataFrame,
     feature_groups: dict,
     main_target: str,
-    domain_score_threshold: float = 0.01,  # Lower threshold for correlation
+    domain_score_threshold: float = 0.01,
     correlation_threshold: float = 0.95
 ):
     """
@@ -783,7 +920,11 @@ def follow_up_domains_pipeline(
             
         # Calculate mean absolute correlation with target
         try:
-            correlations = train_df[feats].corrwith(train_df[main_target]).abs()
+            # Convert both features and target to float32 for consistency
+            features_float = train_df[feats].astype('float32')
+            target_float = train_df[main_target].astype('float32')
+            
+            correlations = features_float.corrwith(target_float).abs()
             mean_corr = correlations.mean()
             domain_scores[domain_name] = float(mean_corr)
         except Exception as e:
@@ -826,7 +967,9 @@ def follow_up_domains_pipeline(
         )
         # Only pass the required columns to avoid errors
         columns_to_use = kept_features + [main_target]
-        train_subset = train_df[columns_to_use].copy()
+        
+        # Convert columns to float32 to avoid PyArrow type issues
+        train_subset = train_df[columns_to_use].copy().astype('float32')
         train_pruned = selector.fit_transform(train_subset)
         pruned_features = [f for f in train_pruned.columns if f != main_target]
         
@@ -834,11 +977,15 @@ def follow_up_domains_pipeline(
     except Exception as e:
         print(f"Error in correlation pruning: {e}")
         print("Falling back to original features")
+        # Convert to standard Python types in case of error
         pruned_features = kept_features
 
     # -------------------------------------------------
     # 4. Train a final global regression model on pruned features
     # -------------------------------------------------
+    final_score = 0.0
+    feature_importance = None
+    
     print("\nTraining final global regression model with pruned features...")
     try:
         # Check if pruned features exist in both datasets
@@ -850,6 +997,12 @@ def follow_up_domains_pipeline(
         if len(pruned_features) == 0:
             raise ValueError("No valid features remaining after pruning")
             
+        # Convert all feature data to float32 to avoid PyArrow type issues
+        X_train = train_df[pruned_features].astype('float32')
+        y_train = train_df[main_target].astype('float32')
+        X_val = val_df[pruned_features].astype('float32')
+        y_val = val_df[main_target].astype('float32')
+        
         # Train the model with optimized parameters for Numerai
         final_model = LGBMRegressor(
             n_estimators=300,
@@ -864,14 +1017,14 @@ def follow_up_domains_pipeline(
         )
         
         final_model.fit(
-            train_df[pruned_features], 
-            train_df[main_target],
+            X_train, 
+            y_train,
             eval_metric='rmse'
         )
         
         # Generate predictions and calculate correlation
-        val_preds = final_model.predict(val_df[pruned_features])
-        final_score = np.corrcoef(val_df[main_target].values, val_preds)[0, 1]
+        val_preds = final_model.predict(X_val)
+        final_score = np.corrcoef(y_val.values, val_preds)[0, 1]
         print(f"Final model correlation score: {final_score:.4f}")
         
         # Calculate feature importance
@@ -883,18 +1036,25 @@ def follow_up_domains_pipeline(
     except Exception as e:
         print(f"Error in final model training: {e}")
         print("Returning partial results without final model")
-        final_score = 0.0
-        feature_importance = pd.DataFrame({'feature': pruned_features, 'importance': 0.0})
 
     # -------------------------------------------------
     # 5. Return results
     # -------------------------------------------------
+    # Always return serializable objects
+    if feature_importance is not None:
+        feature_importance_dict = {
+            'features': feature_importance['feature'].tolist(),
+            'importance': feature_importance['importance'].tolist()
+        }
+    else:
+        feature_importance_dict = {'features': [], 'importance': []}
+        
     results = {
         'domain_scores': domain_scores,
         'kept_domains': kept_domains,
         'pruned_features': pruned_features,
-        'final_model_score': final_score,
-        'feature_importance': feature_importance.head(20) if len(feature_importance) > 0 else None
+        'final_model_score': float(final_score),
+        'feature_importance': feature_importance_dict
     }
     return results
 
