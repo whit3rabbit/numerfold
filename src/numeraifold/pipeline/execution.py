@@ -584,6 +584,7 @@ def run_domains_only_pipeline(
                 main_target=main_target,
                 num_aux_targets=len(aux_targets)  # Changed from 0 to len(aux_targets)
             )
+            print([col for col in train_df.columns if col.startswith('target_')])
             missing_targets = [t for t in aux_targets if t not in train_df.columns]
             if missing_targets:
                 raise ValueError(f"Specified auxiliary targets not found in data: {missing_targets}")

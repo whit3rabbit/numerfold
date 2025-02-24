@@ -17,77 +17,92 @@ from numerapi import NumerAPI
 
 
 def load_data(data_version="v5.0", feature_set="small",
-              main_target="target", num_aux_targets=5):
+              main_target="target", aux_targets=None, num_aux_targets=5):
     """
-    Load data with memory-efficient settings and return training/validation DataFrames, features, and targets.
+    Load data with memory-efficient settings and robust target handling.
     
     Parameters:
-        data_version (str): Identifier for the data version/folder.
-        feature_set (str): The feature set key to use from the features metadata. Options: 'small', 'medium', 'all'.
-        main_target (str): The primary target column name.
-        num_aux_targets (int): Number of auxiliary target columns to include.
+        data_version (str): Identifier for the data version/folder
+        feature_set (str): Feature set key to use ('small', 'medium', 'all')
+        main_target (str): Primary target column name
+        aux_targets (list): Optional list of specific auxiliary targets to include
+        num_aux_targets (int): Number of random auxiliary targets to include if aux_targets not specified
     
     Returns:
-        tuple: A tuple containing:
-            - train_df (pd.DataFrame): Training data with selected columns.
-            - val_df (pd.DataFrame): Validation data with selected columns.
-            - features (list): List of feature names used.
-            - all_targets (list): List of target column names used.
+        tuple: (train_df, val_df, features, all_targets)
     """
     print(f"Loading {data_version} data with {feature_set} feature set...")
-
+    
+    # Download data if needed
     napi = NumerAPI()
+    for file in ['train.parquet', 'validation.parquet', 'features.json']:
+        filepath = f"{data_version}/{file}"
+        if not os.path.exists(filepath):
+            print(f"Downloading {file}...")
+            napi.download_dataset(filepath)
 
-    if not os.path.exists(f"{data_version}/train.parquet"):
-        print("Downloading train dataset...")
-        napi.download_dataset(f"{data_version}/train.parquet")
-
-    if not os.path.exists(f"{data_version}/validation.parquet"):
-        print("Downloading validation dataset...")
-        napi.download_dataset(f"{data_version}/validation.parquet")
-
-    if not os.path.exists(f"{data_version}/features.json"):
-        print("Downloading feature metadata...")
-        napi.download_dataset(f"{data_version}/features.json")
-
+    # Load feature metadata
     with open(f"{data_version}/features.json") as f:
         feature_metadata = json.load(f)
     features = feature_metadata["feature_sets"][feature_set]
 
+    # Get schema and available targets
     schema = pq.read_schema(f"{data_version}/train.parquet")
     all_columns = schema.names
     available_targets = [col for col in all_columns if col.startswith('target')]
-
+    
+    # Validate and process main target
     if main_target not in available_targets:
         print(f"Warning: {main_target} not found in dataset. Using first available target.")
         main_target = available_targets[0] if available_targets else None
-
-    aux_targets = [t for t in available_targets if t != main_target][:num_aux_targets]
-    all_targets = [main_target] + aux_targets if main_target else aux_targets
-
-    if not all_targets:
-        print("No target columns found. Please check the dataset.")
+        
+    if not main_target:
+        print("No valid main target found. Please check the dataset.")
         return None, None, features, []
 
-    print(f"Using targets: {all_targets}")
+    final_targets = [main_target]
 
-    print(f"Reading train data with {len(features)} features and {len(all_targets)} targets...")
+    # Process specified auxiliary targets if provided
+    if aux_targets:
+        # First check if all specified targets exist
+        missing_targets = [t for t in aux_targets if t not in available_targets]
+        if missing_targets:
+            print(f"Warning: Some specified targets are missing: {missing_targets}")
+            # Don't modify the aux_targets list - let the pipeline handle the error
+            
+        # Add all specified aux targets to final targets
+        final_targets.extend([t for t in aux_targets if t != main_target])
+    else:
+        # Add random auxiliary targets if no specific targets provided
+        remaining_targets = [t for t in available_targets if t != main_target]
+        if num_aux_targets > 0:
+            num_to_add = min(num_aux_targets, len(remaining_targets))
+            if num_to_add < num_aux_targets:
+                print(f"Warning: Only {num_to_add} additional targets available")
+            selected = np.random.choice(remaining_targets, size=num_to_add, replace=False)
+            final_targets.extend(selected)
+
+    print(f"Using targets: {final_targets}")
+    
+    # Load data with memory efficiency
+    columns_to_load = ["era"] + features + final_targets
+    print(f"Reading train data with {len(features)} features and {len(final_targets)} targets...")
+    
     train_df = pd.read_parquet(
         f"{data_version}/train.parquet",
-        columns=["era"] + features + all_targets,
+        columns=columns_to_load,
         dtype_backend='pyarrow'
     )
-
+    
     print("Reading validation data...")
     val_df = pd.read_parquet(
         f"{data_version}/validation.parquet",
-        columns=["era"] + features + all_targets,
+        columns=columns_to_load,
         dtype_backend='pyarrow'
     )
-
+    
     print(f"Train shape: {train_df.shape}, Validation shape: {val_df.shape}")
-    return train_df, val_df, features, all_targets
-
+    return train_df, val_df, features, final_targets
 
 def process_in_batches(df, model, features, device='cuda' if torch.cuda.is_available() else 'cpu'):
     """
