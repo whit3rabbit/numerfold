@@ -14,15 +14,17 @@ import matplotlib.pyplot as plt
 import traceback
 import umap
 import os
+from lightgbm import LGBMClassifier
 import traceback
 from typing import Optional, Dict, List
 import pyarrow.parquet as pq
 import seaborn as sns
 from collections import defaultdict
+from feature_engine.selection import SmartCorrelatedSelection
 
 # Sklearn
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import roc_auc_score, silhouette_score
 from sklearn.manifold import TSNE
 
 # Configuration and seed settings
@@ -38,6 +40,7 @@ from numeraifold.core.evaluation import run_final_evaluation, print_evaluation_r
 from numeraifold.domains.identification import identify_feature_domains, create_sequence_representation
 from numeraifold.domains.visualization import visualize_feature_domains, visualize_domain_heatmap, create_interactive_domain_visualization
 from numeraifold.domains.analysis import create_evolutionary_profiles, analyze_domain_relationships
+from numeraifold.domains.evaluate import evaluate_domain_performance
 
 # Feature engineering and stability analysis
 from numeraifold.features.engineering import generate_alphafold_features
@@ -206,6 +209,22 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
             except Exception as e:
                 print(f"Warning: Evolutionary profiles generation failed: {e}")
                 profiles = {}
+
+            # Call the follow-up pipeline to refine domains
+            print("Running follow-up domains pipeline to refine and prune features...")
+            followup_results = follow_up_domains_pipeline(
+                train_df=train_df,
+                val_df=val_df,
+                feature_groups=feature_groups,
+                main_target="target",
+                domain_score_threshold=0.51,   # You can adjust this threshold
+                correlation_threshold=0.95       # Adjust pruning threshold if needed
+            )
+            refined_features = followup_results.get('pruned_features', features)
+            print(f"Refined features count: {len(refined_features)}")
+
+            features = refined_features # Set refined features
+
         else:
             # If Phase 1 is completely skipped
             print("Phase 1 fully skipped.")
@@ -676,25 +695,16 @@ def run_domains_only_pipeline(
         # ---------------------------
         # 7. Cluster Validation: Intra-domain Correlation Analysis
         # ---------------------------
-        print("Performing cluster validation via intra-domain correlation analysis...")
+        print("Computing intra-domain correlation matrix...")
         domain_corr_matrix = np.zeros((n_clusters, len(all_targets)))
         for domain_id in range(n_clusters):
             domain_features = [features[i] for i, label in enumerate(cluster_labels) if label == domain_id]
             for j, target in enumerate(all_targets):
-                # Compute average correlation of each feature in the domain with the target
                 corrs = [
                     np.corrcoef(train_df[feat].fillna(0).values, train_df[target].fillna(0).values)[0, 1]
                     for feat in domain_features
                 ]
                 domain_corr_matrix[domain_id, j] = np.mean(corrs)
-        plt.figure(figsize=(12, 8))
-        sns.heatmap(domain_corr_matrix, annot=True, cmap="coolwarm")
-        plt.title("Domain Correlation Matrix with Targets")
-        plt.xlabel("Targets")
-        plt.ylabel("Domains")
-        plt.show()
-        # Optionally, you can save this plot:
-        # plt.savefig(save_path.replace('.csv', '_domain_validation.png'), dpi=120, bbox_inches='tight')
         results['domain_validation'] = domain_corr_matrix.tolist()
         
         # ---------------------------
@@ -727,6 +737,120 @@ def run_domains_only_pipeline(
         print(f"Pipeline error: {e}")
         traceback.print_exc()
         return {'error': str(e)}
+
+def follow_up_domains_pipeline(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    feature_groups: dict,
+    main_target: str,
+    domain_score_threshold: float = 0.51,
+    correlation_threshold: float = 0.95
+):
+    """
+    Follow-up pipeline that:
+      1) Evaluates each domain's performance with a quick model
+      2) Filters out low-performing domains
+      3) Prunes highly correlated features within the kept domains
+      4) Trains a final global model on the pruned features
+      5) Optionally trains a domain-ensemble model for comparison
+
+    Args:
+        train_df (pd.DataFrame): Training data (features + target).
+        val_df   (pd.DataFrame): Validation data (features + target).
+        feature_groups (dict): { 'domain_0': [feat1, feat2, ...], ... }
+        main_target (str): Name of the target column in train_df/val_df.
+        domain_score_threshold (float): Minimum AUC threshold to keep a domain.
+        correlation_threshold (float): Threshold for feature correlation pruning.
+
+    Returns:
+        dict: Contains domain_scores, kept_domains, final_model_score,
+              ensemble_score (if used), pruned_features, etc.
+    """
+
+    # -------------------------------------------------
+    # 1. Evaluate domain performance
+    # -------------------------------------------------
+    print("Evaluating domain performance...")
+    domain_scores = {}
+    for domain_name, feats in feature_groups.items():
+        score = evaluate_domain_performance(train_df, val_df, feats, main_target)
+        domain_scores[domain_name] = score
+    
+    print("Domain performance scores:")
+    for d, s in domain_scores.items():
+        print(f"  {d}: {s:.4f}")
+
+    # -------------------------------------------------
+    # 2. Filter out low-performing domains
+    # -------------------------------------------------
+    print(f"\nFiltering domains with AUC >= {domain_score_threshold}...")
+    kept_domains = [d for d, s in domain_scores.items() if s >= domain_score_threshold]
+    print("Kept domains:", kept_domains)
+
+    # Gather all features from kept domains
+    kept_features = []
+    for d in kept_domains:
+        kept_features.extend(feature_groups[d])
+    kept_features = list(set(kept_features))  # unique
+
+    # -------------------------------------------------
+    # 3. Correlation pruning within kept features
+    # -------------------------------------------------
+    print(f"\nPruning correlated features (threshold={correlation_threshold})...")
+    # Fit the selector on training data's kept features
+    selector = SmartCorrelatedSelection(threshold=correlation_threshold, variables=kept_features)
+    train_pruned = selector.fit_transform(train_df)
+    pruned_features = train_pruned.columns.drop(main_target).tolist()
+
+    # Match columns for validation
+    val_pruned = val_df[pruned_features]
+
+    print(f"Reduced from {len(kept_features)} kept features to {len(pruned_features)} after pruning")
+
+    # -------------------------------------------------
+    # 4. Train a final global model on pruned features
+    # -------------------------------------------------
+    print("\nTraining final global model with pruned features...")
+    final_model = LGBMClassifier(random_state=42)
+    final_model.fit(train_pruned[pruned_features], train_pruned[main_target])
+    preds_final = final_model.predict_proba(val_pruned)[:, 1]
+    final_model_score = roc_auc_score(val_df[main_target], preds_final)
+    print(f"Final global model AUC: {final_model_score:.4f}")
+
+    # -------------------------------------------------
+    # 5. (Optional) Train a domain-ensemble model for comparison
+    # -------------------------------------------------
+    print("\nTraining domain-ensemble models (only for kept domains)...")
+    domain_models = {}
+    for d in kept_domains:
+        feats = list(set(feature_groups[d]).intersection(set(pruned_features)))
+        clf = LGBMClassifier(random_state=42)
+        clf.fit(train_pruned[feats], train_pruned[main_target])
+        domain_models[d] = clf
+
+    # Ensemble predictions (simple average)
+    print("Averaging predictions from kept domains...")
+    ensemble_preds = np.zeros(len(val_pruned))
+    for d in kept_domains:
+        feats = list(set(feature_groups[d]).intersection(set(pruned_features)))
+        ensemble_preds += domain_models[d].predict_proba(val_pruned[feats])[:, 1]
+    ensemble_preds /= len(kept_domains)
+
+    ensemble_score = roc_auc_score(val_df[main_target], ensemble_preds)
+    print(f"Domain-ensemble AUC: {ensemble_score:.4f}")
+
+    # -------------------------------------------------
+    # 6. Return summary results
+    # -------------------------------------------------
+    results = {
+        'domain_scores': domain_scores,
+        'kept_domains': kept_domains,
+        'pruned_features': pruned_features,
+        'final_model_score': final_model_score,
+        'ensemble_score': ensemble_score
+    }
+    return results
+
 
 def extract_feature_domains_only(train_df, features, n_clusters=10,
                                  random_seed=42, save_path='feature_domains_data.csv'):

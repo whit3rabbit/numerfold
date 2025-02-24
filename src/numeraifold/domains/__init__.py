@@ -1,3 +1,4 @@
 from .visualization import visualize_feature_domains, visualize_domain_heatmap, create_interactive_domain_visualization
 from .identification import FeatureDomainIdentifier, identify_feature_domains, create_sequence_representation
 from .analysis import analyze_domain_relationships, create_evolutionary_profiles
+from .evaluate import evaluate_domain_performance
