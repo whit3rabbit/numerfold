@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import traceback
 import umap
 import os
-from lightgbm import LGBMClassifier
+from lightgbm import LGBMRegressor
 import traceback
 from typing import Optional, Dict, List
 import pyarrow.parquet as pq
@@ -553,201 +553,168 @@ def chunked_data_loader(
         )
         yield chunk, features, all_targets
 
-def run_domains_only_pipeline(
-    data_version: str = "v5.0",
-    feature_set: str = "medium",
-    main_target: str = "target",
-    num_aux_targets: int = 3,
-    aux_targets: Optional[List[str]] = None,
-    sample_size: Optional[int] = None,
-    n_clusters: Optional[int] = None,  # if None, dynamic clustering will determine optimal clusters
-    save_path: str = 'feature_domains_data.csv',
-    chunk_size: int = 10000,
-    use_incremental: bool = True,
-    skip_visualizations: bool = False,
-    random_seed: int = 42
-) -> Dict:
-    print(f"Starting enhanced domain pipeline with {feature_set} feature set")
-    log_memory_usage("Initial")
-    results = {}
+def follow_up_domains_pipeline(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    feature_groups: dict,
+    main_target: str,
+    domain_score_threshold: float = 0.01,  # Lower threshold for correlation
+    correlation_threshold: float = 0.95
+):
+    """
+    Follow-up pipeline that:
+      1) Evaluates each domain's performance using correlation metrics
+      2) Filters out low-performing domains
+      3) Prunes highly correlated features within the kept domains
+      4) Trains a final global regression model on the pruned features
 
-    try:
-        # ---------------------------
-        # 1. Data Loading & Preparation
-        # ---------------------------
-        print("Loading data...")
-        if aux_targets is not None:
-            print(f"Using specified auxiliary targets: {aux_targets}")
-            train_df, val_df, features, all_targets = load_data(
-                data_version=data_version,
-                feature_set=feature_set,
-                main_target=main_target,
-                aux_targets=aux_targets,  # Pass the aux_targets directly
-                num_aux_targets=0  # Set to 0 to prevent random selection
-            )
-            # Check if all specified targets are in the loaded data
-            available_targets = [col for col in train_df.columns if col.startswith('target_')]
-            print(f"Available targets: {available_targets}")
-            missing_targets = [t for t in aux_targets if t not in train_df.columns]
-            if missing_targets:
-                raise ValueError(f"Specified auxiliary targets not found in data: {missing_targets}")
-            all_targets = [main_target] + aux_targets  # Use the specified targets
-        else:
-            print(f"Selecting {num_aux_targets} random auxiliary targets")
-            train_df, val_df, features, all_targets = load_data(
-                data_version=data_version,
-                feature_set=feature_set,
-                main_target=main_target,
-                num_aux_targets=num_aux_targets
-            )
-        
-        if train_df is None or val_df is None:
-            raise ValueError("Failed to load data")
+    Args:
+        train_df (pd.DataFrame): Training data (features + target).
+        val_df   (pd.DataFrame): Validation data (features + target).
+        feature_groups (dict): { 'domain_0': [feat1, feat2, ...], ... }
+        main_target (str): Name of the target column in train_df/val_df.
+        domain_score_threshold (float): Minimum correlation threshold to keep a domain.
+        correlation_threshold (float): Threshold for feature correlation pruning.
+
+    Returns:
+        dict: Contains domain_scores, kept_domains, final_model_score, pruned_features, etc.
+    """
+
+    # -------------------------------------------------
+    # 1. Evaluate domain performance using correlation
+    # -------------------------------------------------
+    print("Evaluating domain performance...")
+    domain_scores = {}
+    for domain_name, feats in feature_groups.items():
+        # Handle empty or tiny feature groups
+        if len(feats) < 5:
+            print(f"  {domain_name}: Too few features ({len(feats)}), skipping")
+            domain_scores[domain_name] = 0.0
+            continue
             
-        print(f"Loaded data with {len(features)} features")
-        print(f"Using targets: {all_targets}")
-        print(f"Train shape: {train_df.shape}, Val shape: {val_df.shape}")
-
-        # Apply sampling if specified
-        if sample_size is not None and sample_size < len(train_df):
-            print(f"Sampling {sample_size} rows from training data")
-            train_df = train_df.sample(n=sample_size, random_state=random_seed)
-        
-        # ---------------------------
-        # 2. Compute Feature-Target Correlations
-        # ---------------------------
-        print("Computing feature-target correlations...")
-        correlations = []
-        for feature in features:
-            feature_corrs = []
-            for target in all_targets:
-                # Handle NaNs by filling with 0
-                feature_data = train_df[feature].fillna(0).values
-                target_data = train_df[target].fillna(0).values
-                corr = np.corrcoef(feature_data, target_data)[0, 1]
-                feature_corrs.append(corr)
-            correlations.append(feature_corrs)
-        correlations = np.array(correlations)
-        print(f"Correlation matrix shape: {correlations.shape}")
-        
-        # ---------------------------
-        # 3. Enhanced Embeddings using t-SNE
-        # ---------------------------
-        print("Applying t-SNE for enhanced feature embeddings...")
-        tsne = TSNE(n_components=3, perplexity=30, random_state=random_seed)
-        feature_embeddings = tsne.fit_transform(correlations)
-        print(f"Feature embeddings shape: {feature_embeddings.shape}")
-
-        # ---------------------------
-        # 4. Dynamic Cluster Determination
-        # ---------------------------
-        if n_clusters is None:
-            print("Determining optimal number of clusters dynamically using silhouette scores...")
-            silhouette_scores = []
-            k_range = range(10, 30)
-            for k in k_range:
-                clusterer = KMeans(n_clusters=k, random_state=random_seed)
-                labels = clusterer.fit_predict(feature_embeddings)
-                score = silhouette_score(feature_embeddings, labels)
-                silhouette_scores.append(score)
-                print(f"Silhouette score for k={k}: {score:.4f}")
-            optimal_k = k_range[np.argmax(silhouette_scores)]
-            n_clusters = optimal_k
-            print(f"Optimal number of clusters determined: {n_clusters}")
-        else:
-            print(f"Using user-specified number of clusters: {n_clusters}")
-
-        # ---------------------------
-        # 5. Clustering Features using KMeans
-        # ---------------------------
-        print(f"Clustering features into {n_clusters} domains...")
-        clusterer = KMeans(n_clusters=n_clusters, random_state=random_seed)
-        cluster_labels = clusterer.fit_predict(feature_embeddings)
-
-        # Create feature groups (domains)
-        feature_groups = defaultdict(list)
-        for idx, label in enumerate(cluster_labels):
-            domain_name = f"domain_{label}"
-            feature_groups[domain_name].append(features[idx])
-        feature_groups = dict(feature_groups)
-
-        # ---------------------------
-        # 6. Save Domain Data
-        # ---------------------------
-        results['feature_groups'] = feature_groups
-        results['num_domains'] = len(feature_groups)
-        results['targets_used'] = all_targets
-
+        # Calculate mean absolute correlation with target
         try:
-            print("Saving domain data...")
-            domain_data = []
-            for idx, feature in enumerate(features):
-                domain_data.append({
-                    'feature': feature,
-                    'domain_id': int(cluster_labels[idx]),
-                    'domain_name': f"domain_{int(cluster_labels[idx])}",
-                    **{f'dimension_{i+1}': emb for i, emb in enumerate(feature_embeddings[idx])}
-                })
-            domains_df = pd.DataFrame(domain_data)
-            domains_df.to_csv(save_path, index=False)
-            results['domains_saved_path'] = save_path
-            print(f"Domain data saved to: {save_path}")
-        except Exception as save_error:
-            print(f"Error saving domain data: {save_error}")
-            results['save_error'] = str(save_error)
-        
-        # ---------------------------
-        # 7. Cluster Validation: Intra-domain Correlation Analysis
-        # ---------------------------
-        print("Computing intra-domain correlation matrix...")
-        domain_corr_matrix = np.zeros((n_clusters, len(all_targets)))
-        for domain_id in range(n_clusters):
-            domain_features = [features[i] for i, label in enumerate(cluster_labels) if label == domain_id]
-            for j, target in enumerate(all_targets):
-                corrs = [
-                    np.corrcoef(train_df[feat].fillna(0).values, train_df[target].fillna(0).values)[0, 1]
-                    for feat in domain_features
-                ]
-                domain_corr_matrix[domain_id, j] = np.mean(corrs)
-        results['domain_validation'] = domain_corr_matrix.tolist()
-        
-        # ---------------------------
-        # 8. Additional Visualizations
-        # ---------------------------
-        if not skip_visualizations:
-            try:
-                print("Generating additional visualizations using UMAP...")
-                reducer = umap.UMAP(random_state=random_seed)
-                vis_embeddings = reducer.fit_transform(feature_embeddings)
-                
-                plt.figure(figsize=(10, 8))
-                scatter = plt.scatter(vis_embeddings[:, 0], vis_embeddings[:, 1],
-                                      c=cluster_labels, cmap='tab20', s=10)
-                plt.colorbar(scatter)
-                plt.title("Feature Domains Visualization (UMAP)")
-                
-                plot_path = save_path.replace('.csv', '_plot.png')
-                plt.savefig(plot_path, dpi=120, bbox_inches='tight')
-                plt.close()
-                results['plot_path'] = plot_path
-                print("Visualization generated successfully")
-            except Exception as viz_error:
-                print(f"Error generating visualizations: {viz_error}")
-                results['visualization_error'] = str(viz_error)
-        
-        return results
+            correlations = train_df[feats].corrwith(train_df[main_target]).abs()
+            mean_corr = correlations.mean()
+            domain_scores[domain_name] = float(mean_corr)
+        except Exception as e:
+            print(f"  Error evaluating {domain_name}: {e}")
+            domain_scores[domain_name] = 0.0
+    
+    print("Domain performance scores (correlation with target):")
+    for d, s in domain_scores.items():
+        print(f"  {d}: {s:.4f}")
 
+    # -------------------------------------------------
+    # 2. Filter out low-performing domains
+    # -------------------------------------------------
+    print(f"\nFiltering domains with correlation >= {domain_score_threshold}...")
+    kept_domains = [d for d, s in domain_scores.items() if s >= domain_score_threshold]
+    print(f"Kept domains: {len(kept_domains)}/{len(domain_scores)}")
+    
+    # Handle the case where no domains meet the threshold
+    if not kept_domains:
+        print("Warning: No domains met threshold. Keeping top 3 domains instead.")
+        kept_domains = sorted(domain_scores.keys(), key=lambda d: domain_scores[d], reverse=True)[:3]
+        
+    # Gather all features from kept domains
+    kept_features = []
+    for d in kept_domains:
+        kept_features.extend(feature_groups[d])
+    kept_features = list(set(kept_features))  # Remove duplicates
+    print(f"Total features from kept domains: {len(kept_features)}")
+
+    # -------------------------------------------------
+    # 3. Correlation pruning within kept features
+    # -------------------------------------------------
+    print(f"\nPruning correlated features (threshold={correlation_threshold})...")
+    try:
+        # Fit the selector on training data's kept features
+        selector = SmartCorrelatedSelection(
+            threshold=correlation_threshold, 
+            variables=kept_features,
+            method='pearson'
+        )
+        # Only pass the required columns to avoid errors
+        columns_to_use = kept_features + [main_target]
+        train_subset = train_df[columns_to_use].copy()
+        train_pruned = selector.fit_transform(train_subset)
+        pruned_features = [f for f in train_pruned.columns if f != main_target]
+        
+        print(f"Reduced from {len(kept_features)} to {len(pruned_features)} features after pruning")
     except Exception as e:
-        print(f"Pipeline error: {e}")
-        traceback.print_exc()
-        return {'error': str(e)}
+        print(f"Error in correlation pruning: {e}")
+        print("Falling back to original features")
+        pruned_features = kept_features
+
+    # -------------------------------------------------
+    # 4. Train a final global regression model on pruned features
+    # -------------------------------------------------
+    print("\nTraining final global regression model with pruned features...")
+    try:
+        # Check if pruned features exist in both datasets
+        valid_features = [f for f in pruned_features if f in train_df.columns and f in val_df.columns]
+        if len(valid_features) < len(pruned_features):
+            print(f"Warning: {len(pruned_features) - len(valid_features)} features not found in both datasets")
+            pruned_features = valid_features
+            
+        if len(pruned_features) == 0:
+            raise ValueError("No valid features remaining after pruning")
+            
+        # Train the model with optimized parameters for Numerai
+        final_model = LGBMRegressor(
+            n_estimators=300,
+            learning_rate=0.01,
+            max_depth=6,
+            num_leaves=31,
+            colsample_bytree=0.7,
+            subsample=0.7,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            random_state=42
+        )
+        
+        final_model.fit(
+            train_df[pruned_features], 
+            train_df[main_target],
+            eval_metric='rmse'
+        )
+        
+        # Generate predictions and calculate correlation
+        val_preds = final_model.predict(val_df[pruned_features])
+        final_score = np.corrcoef(val_df[main_target].values, val_preds)[0, 1]
+        print(f"Final model correlation score: {final_score:.4f}")
+        
+        # Calculate feature importance
+        feature_importance = pd.DataFrame({
+            'feature': pruned_features,
+            'importance': final_model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+    except Exception as e:
+        print(f"Error in final model training: {e}")
+        print("Returning partial results without final model")
+        final_score = 0.0
+        feature_importance = pd.DataFrame({'feature': pruned_features, 'importance': 0.0})
+
+    # -------------------------------------------------
+    # 5. Return results
+    # -------------------------------------------------
+    results = {
+        'domain_scores': domain_scores,
+        'kept_domains': kept_domains,
+        'pruned_features': pruned_features,
+        'final_model_score': final_score,
+        'feature_importance': feature_importance.head(20) if len(feature_importance) > 0 else None
+    }
+    return results
 
 def follow_up_domains_pipeline(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     feature_groups: dict,
     main_target: str,
-    domain_score_threshold: float = 0.51,
+    domain_score_threshold: float = 0.01,
     correlation_threshold: float = 0.95
 ):
     """
