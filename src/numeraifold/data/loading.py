@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import pyarrow.parquet as pq
+import pyarrow as pa
 from numerapi import NumerAPI
 import gc
 
@@ -105,10 +106,7 @@ def load_data(data_version="v5.0", feature_set="small",
             max_rows=max_rows,
             convert_dtypes=convert_dtypes
         )
-    else:
-        # Load using PyArrow for efficient type conversion
-        import pyarrow as pa
-
+    else:       
         def cast_table_to_float32(table):
             """Cast numeric columns to float32 in PyArrow table"""
             for col in table.column_names:
@@ -199,6 +197,7 @@ def load_data_in_chunks(filepath, columns, chunk_size=10000, max_rows=None, conv
                         table.column_names.index(col),
                         col,
                         table[col].cast(pa.float32())
+                    )
         
         df = table.to_pandas()
         chunks.append(df.iloc[:chunk_size])  # Handle partial row groups
