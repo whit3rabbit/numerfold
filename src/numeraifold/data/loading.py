@@ -106,59 +106,57 @@ def load_data(data_version="v5.0", feature_set="small",
             convert_dtypes=convert_dtypes
         )
     else:
-        # First load with pyarrow backend for memory efficiency
-        train_df = pd.read_parquet(
-            f"{data_version}/train.parquet",
-            columns=columns_to_load,
-            dtype_backend='pyarrow'
-        )
+        # Load using PyArrow for efficient type conversion
+        import pyarrow as pa
+
+        def cast_table_to_float32(table):
+            """Cast numeric columns to float32 in PyArrow table"""
+            for col in table.column_names:
+                if col == 'era':
+                    continue
+                field = table.schema.field(col)
+                if pa.types.is_numeric(field.type):
+                    table = table.set_column(
+                        table.column_names.index(col),
+                        col,
+                        table[col].cast(pa.float32())
+                    )
+            return table
+
+        # Load and process training data
+        table = pq.read_table(f"{data_version}/train.parquet", columns=columns_to_load)
+        if convert_dtypes:
+            table = cast_table_to_float32(table)
+        train_df = table.to_pandas(dtype_backend='pyarrow' if not convert_dtypes else 'numpy')
         
-        # Limit rows if specified
-        if max_rows is not None and max_rows < len(train_df):
+        if max_rows and len(train_df) > max_rows:
             print(f"Limiting training data to {max_rows} rows")
             train_df = train_df.head(max_rows)
+
+        # Load and process validation data
+        table_val = pq.read_table(f"{data_version}/validation.parquet", columns=columns_to_load)
+        if convert_dtypes:
+            table_val = cast_table_to_float32(table_val)
+        val_df = table_val.to_pandas(dtype_backend='pyarrow' if not convert_dtypes else 'numpy')
         
-        print("Reading validation data...")
-        val_df = pd.read_parquet(
-            f"{data_version}/validation.parquet",
-            columns=columns_to_load,
-            dtype_backend='pyarrow'
-        )
-        
-        # Limit validation rows if specified
-        if max_rows is not None and max_rows < len(val_df):
+        if max_rows and len(val_df) > max_rows:
             print(f"Limiting validation data to {max_rows} rows")
             val_df = val_df.head(max_rows)
+
+    # Post-processing for chunked data
+    if chunk_size is not None and convert_dtypes:
+        def bulk_convert(df):
+            """Optimized bulk conversion for chunked data"""
+            numeric_cols = df.select_dtypes(include=np.number).columns.difference(['era'])
+            if not numeric_cols.empty:
+                df[numeric_cols] = df[numeric_cols].astype('float32')
+            return df
         
-        # Convert PyArrow types to standard Python types if requested
-        if convert_dtypes:
-            print("Converting PyArrow dtypes to standard NumPy dtypes...")
-            
-            # Function to safely convert a dataframe's numeric columns to float32
-            def convert_numeric_to_float32(df):
-                df_copy = df.copy()
-                gc.collect()  # Collect garbage to free memory
-                
-                for col in df.columns:
-                    # Skip non-feature columns like 'era'
-                    if col == 'era':
-                        continue
-                        
-                    # Check if column is numeric
-                    try:
-                        # Convert PyArrow types to standard float32
-                        if pd.api.types.is_numeric_dtype(df[col]):
-                            df_copy[col] = df[col].astype('float32')
-                            # Release memory from original column
-                            del df[col]
-                            gc.collect()
-                    except Exception as e:
-                        print(f"Warning: Couldn't convert column {col}: {e}")
-                return df_copy
-                
-            train_df = convert_numeric_to_float32(train_df)
-            val_df = convert_numeric_to_float32(val_df)
-    
+        print("Optimizing dtype conversion for chunked data...")
+        train_df = bulk_convert(train_df)
+        val_df = bulk_convert(val_df)
+        gc.collect()
+
     print(f"Train shape: {train_df.shape}, Validation shape: {val_df.shape}")
     return train_df, val_df, features, final_targets
 
@@ -177,53 +175,40 @@ def load_data_in_chunks(filepath, columns, chunk_size=10000, max_rows=None, conv
     Returns:
         pd.DataFrame: Combined dataframe from all chunks
     """   
-    # Get total number of rows
     parquet_file = pq.ParquetFile(filepath)
     total_rows = parquet_file.metadata.num_rows
-    
-    # Determine number of rows to load
-    if max_rows is not None:
+    if max_rows:
         total_rows = min(total_rows, max_rows)
-    
-    # Calculate number of chunks
-    num_chunks = (total_rows + chunk_size - 1) // chunk_size
-    print(f"Loading {total_rows} rows in {num_chunks} chunks")
-    
-    # Load data in chunks
+
     chunks = []
-    for i in range(num_chunks):
-        start_row = i * chunk_size
-        # Don't exceed max_rows or total number of rows
-        rows_to_read = min(chunk_size, total_rows - start_row)
-        
-        print(f"Loading chunk {i+1}/{num_chunks} (rows {start_row} to {start_row + rows_to_read})")
-        chunk = pd.read_parquet(
-            filepath,
-            columns=columns,
-            dtype_backend='pyarrow',
-            offset=start_row,
-            rows=rows_to_read
-        )
-        
-        # Convert types if requested
+    for i in range(0, total_rows, chunk_size):
+        # Read single row group at a time for efficiency
+        row_group = i // parquet_file.metadata.row_group(0).num_rows
+        if row_group >= parquet_file.num_row_groups:
+            break
+
+        table = parquet_file.read_row_group(row_group, columns=columns)
         if convert_dtypes:
-            print(f"Converting chunk {i+1} data types...")
-            for col in chunk.columns:
-                if col != 'era' and pd.api.types.is_numeric_dtype(chunk[col]):
-                    chunk[col] = chunk[col].astype('float32')
-            
-        chunks.append(chunk)
+            # Convert numeric columns to float32
+            for col in table.column_names:
+                if col == 'era':
+                    continue
+                field = table.schema.field(col)
+                if pa.types.is_numeric(field.type):
+                    table = table.set_column(
+                        table.column_names.index(col),
+                        col,
+                        table[col].cast(pa.float32())
         
-        # Force garbage collection to free memory
-        gc.collect()
-    
-    # Combine chunks
-    print("Combining chunks...")
+        df = table.to_pandas()
+        chunks.append(df.iloc[:chunk_size])  # Handle partial row groups
+        
+        if max_rows and sum(len(c) for c in chunks) >= max_rows:
+            break
+
     result = pd.concat(chunks, ignore_index=True)
-    
-    # Clear chunks to free memory
-    chunks.clear()
-    gc.collect()
+    if max_rows:
+        result = result.head(max_rows)
     
     return result
 
