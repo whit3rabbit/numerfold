@@ -20,16 +20,6 @@ def load_data(data_version="v5.0", feature_set="small",
               main_target="target", aux_targets=None, num_aux_targets=5):
     """
     Load data with memory-efficient settings and robust target handling.
-    
-    Parameters:
-        data_version (str): Identifier for the data version/folder
-        feature_set (str): Feature set key to use ('small', 'medium', 'all')
-        main_target (str): Primary target column name
-        aux_targets (list): Optional list of specific auxiliary targets to include
-        num_aux_targets (int): Number of random auxiliary targets to include if aux_targets not specified
-    
-    Returns:
-        tuple: (train_df, val_df, features, all_targets)
     """
     print(f"Loading {data_version} data with {feature_set} feature set...")
     
@@ -46,12 +36,11 @@ def load_data(data_version="v5.0", feature_set="small",
         feature_metadata = json.load(f)
     features = feature_metadata["feature_sets"][feature_set]
 
-    # Get schema and available targets
+    # Get available targets from schema without printing
     schema = pq.read_schema(f"{data_version}/train.parquet")
-    all_columns = schema.names
-    available_targets = [col for col in all_columns if col.startswith('target')]
+    available_targets = [col for col in schema.names if col.startswith('target')]
     
-    # Validate and process main target
+    # Validate all targets before loading
     if main_target not in available_targets:
         print(f"Warning: {main_target} not found in dataset. Using first available target.")
         main_target = available_targets[0] if available_targets else None
@@ -60,10 +49,15 @@ def load_data(data_version="v5.0", feature_set="small",
         print("No valid main target found. Please check the dataset.")
         return None, None, features, []
 
-    # Build final target list
+    # Validate aux_targets if provided
+    final_targets = [main_target]
     if aux_targets is not None:
-        # Use specified auxiliary targets
-        final_targets = [main_target] + [t for t in aux_targets if t != main_target]
+        missing_targets = [t for t in aux_targets if t not in available_targets]
+        if missing_targets:
+            print(f"Error: The following auxiliary targets are not available: {missing_targets}")
+            print("Available targets:", [t for t in available_targets if t.startswith('target_')])
+            return None, None, features, []
+        final_targets.extend([t for t in aux_targets if t != main_target])
     else:
         # Use random auxiliary targets
         remaining_targets = [t for t in available_targets if t != main_target]
@@ -72,31 +66,34 @@ def load_data(data_version="v5.0", feature_set="small",
             if num_to_add < num_aux_targets:
                 print(f"Warning: Only {num_to_add} additional targets available")
             selected = np.random.choice(remaining_targets, size=num_to_add, replace=False)
-            final_targets = [main_target] + list(selected)
-        else:
-            final_targets = [main_target]
+            final_targets.extend(selected)
 
     print(f"Using targets: {final_targets}")
     
     # Load data with memory efficiency
-    columns_to_load = ["era"] + features + final_targets
-    print(f"Reading train data with {len(features)} features and {len(final_targets)} targets...")
-    
-    train_df = pd.read_parquet(
-        f"{data_version}/train.parquet",
-        columns=columns_to_load,
-        dtype_backend='pyarrow'
-    )
-    
-    print("Reading validation data...")
-    val_df = pd.read_parquet(
-        f"{data_version}/validation.parquet",
-        columns=columns_to_load,
-        dtype_backend='pyarrow'
-    )
-    
-    print(f"Train shape: {train_df.shape}, Validation shape: {val_df.shape}")
-    return train_df, val_df, features, final_targets
+    try:
+        columns_to_load = ["era"] + features + final_targets
+        print(f"Reading train data with {len(features)} features and {len(final_targets)} targets...")
+        
+        train_df = pd.read_parquet(
+            f"{data_version}/train.parquet",
+            columns=columns_to_load,
+            dtype_backend='pyarrow'
+        )
+        
+        print("Reading validation data...")
+        val_df = pd.read_parquet(
+            f"{data_version}/validation.parquet",
+            columns=columns_to_load,
+            dtype_backend='pyarrow'
+        )
+        
+        print(f"Train shape: {train_df.shape}, Validation shape: {val_df.shape}")
+        return train_df, val_df, features, final_targets
+        
+    except Exception as e:
+        print(f"Error loading data: {str(e)}")
+        return None, None, features, []
 
 def process_in_batches(df, model, features, device='cuda' if torch.cuda.is_available() else 'cpu'):
     """
