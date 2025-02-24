@@ -128,7 +128,16 @@ def load_data(data_version="v5.0", feature_set="small",
         table = pq.read_table(f"{data_version}/train.parquet", columns=columns_to_load)
         if convert_dtypes:
             table = cast_table_to_float32(table)
-        train_df = table.to_pandas(dtype_backend='pyarrow' if not convert_dtypes else 'numpy')
+        
+        # Fix: Remove the dtype_backend parameter
+        train_df = table.to_pandas()
+        
+        # If convert_dtypes is False, leave PyArrow types as is
+        # If convert_dtypes is True, convert numeric columns to float32
+        if convert_dtypes:
+            numeric_cols = train_df.select_dtypes(include=np.number).columns.difference(['era'])
+            if not numeric_cols.empty:
+                train_df[numeric_cols] = train_df[numeric_cols].astype('float32')
         
         if max_rows and len(train_df) > max_rows:
             train_df = train_df.head(max_rows)
@@ -137,7 +146,15 @@ def load_data(data_version="v5.0", feature_set="small",
         table_val = pq.read_table(f"{data_version}/validation.parquet", columns=columns_to_load)
         if convert_dtypes:
             table_val = cast_table_to_float32(table_val)
-        val_df = table_val.to_pandas(dtype_backend='pyarrow' if not convert_dtypes else 'numpy')
+        
+        # Fix: Remove the dtype_backend parameter
+        val_df = table_val.to_pandas()
+        
+        # If convert_dtypes is True, convert numeric columns to float32
+        if convert_dtypes:
+            numeric_cols = val_df.select_dtypes(include=np.number).columns.difference(['era'])
+            if not numeric_cols.empty:
+                val_df[numeric_cols] = val_df[numeric_cols].astype('float32')
         
         if max_rows and len(val_df) > max_rows:
             val_df = val_df.head(max_rows)
@@ -158,7 +175,6 @@ def load_data(data_version="v5.0", feature_set="small",
 
     print(f"Train shape: {train_df.shape}, Validation shape: {val_df.shape}")
     return train_df, val_df, features, final_targets
-
 
 def load_data_in_chunks(filepath, columns, chunk_size=10000, max_rows=None, convert_dtypes=True):
     """Optimized chunked loading with PyArrow type conversion"""
@@ -189,7 +205,15 @@ def load_data_in_chunks(filepath, columns, chunk_size=10000, max_rows=None, conv
                         table[col].cast(pa.float32())
                     )
         
+        # Fix: Remove any dtype_backend parameter, then convert types explicitly
         df = table.to_pandas()
+        
+        # Convert numeric columns to float32 if requested
+        if convert_dtypes:
+            numeric_cols = df.select_dtypes(include=np.number).columns.difference(['era'])
+            if not numeric_cols.empty:
+                df[numeric_cols] = df[numeric_cols].astype('float32')
+                
         chunks.append(df.iloc[:chunk_size])
         
         if max_rows and sum(len(c) for c in chunks) >= max_rows:
