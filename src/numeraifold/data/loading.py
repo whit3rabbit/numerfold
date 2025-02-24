@@ -60,27 +60,21 @@ def load_data(data_version="v5.0", feature_set="small",
         print("No valid main target found. Please check the dataset.")
         return None, None, features, []
 
-    final_targets = [main_target]
-
-    # Process specified auxiliary targets if provided
-    if aux_targets:
-        # First check if all specified targets exist
-        missing_targets = [t for t in aux_targets if t not in available_targets]
-        if missing_targets:
-            print(f"Warning: Some specified targets are missing: {missing_targets}")
-            # Don't modify the aux_targets list - let the pipeline handle the error
-            
-        # Add all specified aux targets to final targets
-        final_targets.extend([t for t in aux_targets if t != main_target])
+    # Build final target list
+    if aux_targets is not None:
+        # Use specified auxiliary targets
+        final_targets = [main_target] + [t for t in aux_targets if t != main_target]
     else:
-        # Add random auxiliary targets if no specific targets provided
+        # Use random auxiliary targets
         remaining_targets = [t for t in available_targets if t != main_target]
         if num_aux_targets > 0:
             num_to_add = min(num_aux_targets, len(remaining_targets))
             if num_to_add < num_aux_targets:
                 print(f"Warning: Only {num_to_add} additional targets available")
             selected = np.random.choice(remaining_targets, size=num_to_add, replace=False)
-            final_targets.extend(selected)
+            final_targets = [main_target] + list(selected)
+        else:
+            final_targets = [main_target]
 
     print(f"Using targets: {final_targets}")
     

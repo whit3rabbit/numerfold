@@ -582,13 +582,16 @@ def run_domains_only_pipeline(
                 data_version=data_version,
                 feature_set=feature_set,
                 main_target=main_target,
-                num_aux_targets=len(aux_targets)  # Changed from 0 to len(aux_targets)
+                aux_targets=aux_targets,  # Pass the aux_targets directly
+                num_aux_targets=0  # Set to 0 to prevent random selection
             )
-            print([col for col in train_df.columns if col.startswith('target_')])
+            # Check if all specified targets are in the loaded data
+            available_targets = [col for col in train_df.columns if col.startswith('target_')]
+            print(f"Available targets: {available_targets}")
             missing_targets = [t for t in aux_targets if t not in train_df.columns]
             if missing_targets:
                 raise ValueError(f"Specified auxiliary targets not found in data: {missing_targets}")
-            all_targets = [main_target] + aux_targets
+            all_targets = [main_target] + aux_targets  # Use the specified targets
         else:
             print(f"Selecting {num_aux_targets} random auxiliary targets")
             train_df, val_df, features, all_targets = load_data(
