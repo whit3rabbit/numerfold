@@ -3,6 +3,7 @@ from .visualization import generate_visualizations_from_saved_domains, plot_atte
 from .domain import integrate_domain_data_to_pipeline, check_phase1_files, load_phase1_data
 from .seed import set_seed
 from .logging import log_memory_usage
+from numeraifold.features.stability import calculate_feature_stability
 
 __all__ = [
     'save_model_artifacts',
@@ -17,5 +18,6 @@ __all__ = [
     'check_phase1_files',
     'load_phase1_data',
     'set_seed',
-    'log_memory_usage'
+    'log_memory_usage',
+    'calculate_feature_stability'
 ]
