@@ -20,10 +20,20 @@ from numerapi import NumerAPI
 from numeraifold.utils.logging import log_memory_usage
 
 def load_data(data_version="v5.0", feature_set="small",
-              main_target="target", aux_targets=None, num_aux_targets=5):
+              main_target="target", aux_targets=None, num_aux_targets=5,
+              sample_size=None, random_seed=42):
     """
     Load data with memory-efficient settings, robust target handling,
     and explicit float32 conversion.
+    
+    Args:
+        data_version (str): Version of dataset
+        feature_set (str): Size of feature set
+        main_target (str): Main target column
+        aux_targets (list): Specific auxiliary targets to use
+        num_aux_targets (int): Number of auxiliary targets if aux_targets not specified
+        sample_size (int): If provided, sample this many rows from the dataset
+        random_seed (int): Random seed for reproducibility
     """
     print(f"Loading {data_version} data with {feature_set} feature set...")
    
@@ -74,205 +84,85 @@ def load_data(data_version="v5.0", feature_set="small",
             final_targets.extend(selected)
     print(f"Using targets: {final_targets}")
    
-    # Load data with memory efficiency
+    # Simplify the loading approach for very large datasets
     try:
         columns_to_load = ["era"] + features + final_targets
         print(f"Reading train data with {len(features)} features and {len(final_targets)} targets...")
         
-        # Determine if we need to use chunked loading based on feature set size
-        use_chunked_loading = feature_set in ["medium", "large", "all"] or len(features) > 500
-        
-        if use_chunked_loading:
-            print("Using chunked loading for large dataset...")
-            # Define chunk size based on feature set
-            if feature_set == "large" or feature_set == "all":
-                chunk_size = 10000
-            else:  # medium
-                chunk_size = 20000
-                
-            # Method 1: Use pandas read_parquet with a simple loop for chunking
-            train_chunks = []
-            train_file = f"{data_version}/train.parquet"
-            
-            # Get total rows in the file
+        # Use sampling directly during loading if needed
+        if sample_size is not None:
+            print(f"A sample size of {sample_size} has been specified")
+            # Approach 1: Generate a random sample of row indices
             try:
-                # Try to get file info without reading the entire file
-                train_pf = pq.ParquetFile(train_file)
-                total_rows = train_pf.metadata.num_rows
-                num_chunks = (total_rows + chunk_size - 1) // chunk_size
-                print(f"Train file has {total_rows} rows, loading in {num_chunks} chunks")
-            except Exception as e:
-                print(f"Error getting parquet metadata: {e}")
-                # Fallback to loading whole file to get row count
-                print("Falling back to loading the entire file...")
-                train_df = pd.read_parquet(train_file, columns=columns_to_load)
-                return train_df, None, features, final_targets
-            
-            # Load in chunks - using pandas API directly
-            for i in range(0, total_rows, chunk_size):
-                print(f"Loading train chunk {i//chunk_size + 1}/{num_chunks}")
+                train_file = f"{data_version}/train.parquet"
+                train_metadata = pq.read_metadata(train_file)
+                total_rows = train_metadata.num_rows
+                print(f"Train file has {total_rows} total rows")
                 
-                # Use safe approach with filters to load chunks
-                filters = [('__index_level_0__', '>=', i), ('__index_level_0__', '<', i + chunk_size)]
-                try:
-                    chunk = pd.read_parquet(train_file, columns=columns_to_load, filters=filters)
+                if sample_size < total_rows:
+                    # Generate random sample indices
+                    np.random.seed(random_seed)
+                    sample_indices = np.random.choice(total_rows, size=sample_size, replace=False)
+                    sample_indices.sort()  # Sort for more efficient reading
                     
-                    # If the filter approach didn't work properly, use the older approach
-                    if len(chunk) == total_rows:
-                        print("Filter approach returned all rows, falling back to regular loading")
-                        if i == 0:
-                            # Just keep this first chunk which has all rows
-                            chunk_df = chunk
-                            # Convert features and targets to float32
-                            for col in features + final_targets:
-                                if col in chunk_df.columns:
-                                    chunk_df[col] = chunk_df[col].astype(np.float32)
-                            train_chunks = [chunk_df]
-                            break
-                        else:
-                            # We've already loaded everything on the first iteration, just break
-                            break
-                    
-                    # Convert features and targets to float32
-                    for col in features + final_targets:
-                        if col in chunk.columns:
-                            chunk[col] = chunk[col].astype(np.float32)
-                    
-                    train_chunks.append(chunk)
-                except Exception as chunk_error:
-                    print(f"Error loading chunk {i//chunk_size + 1}: {chunk_error}")
-                    # If we can't load a chunk, try a simpler approach
-                    if i == 0:
-                        print("Falling back to loading the entire file...")
-                        try:
-                            train_df = pd.read_parquet(train_file, columns=columns_to_load)
-                            # Convert features and targets to float32
-                            for col in features + final_targets:
-                                if col in train_df.columns:
-                                    train_df[col] = train_df[col].astype(np.float32)
-                            
-                            val_df = pd.read_parquet(f"{data_version}/validation.parquet", columns=columns_to_load)
-                            # Convert features and targets to float32
-                            for col in features + final_targets:
-                                if col in val_df.columns:
-                                    val_df[col] = val_df[col].astype(np.float32)
-                                    
-                            print(f"Loaded entire files - Train: {train_df.shape}, Val: {val_df.shape}")
-                            return train_df, val_df, features, final_targets
-                        except Exception as e:
-                            print(f"Failed to load entire file: {e}")
-                            return None, None, features, final_targets
-            
-            # Combine chunks if we have any
-            if train_chunks:
-                train_df = pd.concat(train_chunks, ignore_index=True)
-                del train_chunks
-                gc.collect()
-            else:
-                print("No chunks were successfully loaded")
-                return None, None, features, final_targets
-            
-            # Load validation data in chunks
-            val_chunks = []
-            val_file = f"{data_version}/validation.parquet"
-            
-            # Get total rows in validation file
-            try:
-                val_pf = pq.ParquetFile(val_file)
-                val_total_rows = val_pf.metadata.num_rows
-                val_num_chunks = (val_total_rows + chunk_size - 1) // chunk_size
-                print(f"Validation file has {val_total_rows} rows, loading in {val_num_chunks} chunks")
+                    # Load train data with sampling
+                    print(f"Loading a sample of {sample_size} rows from training data...")
+                    train_df = pd.read_parquet(train_file, columns=columns_to_load)
+                    train_df = train_df.iloc[sample_indices].reset_index(drop=True)
+                else:
+                    print(f"Sample size {sample_size} >= total rows {total_rows}, loading all data")
+                    train_df = pd.read_parquet(train_file, columns=columns_to_load)
             except Exception as e:
-                print(f"Error getting validation parquet metadata: {e}")
-                # Try loading the entire validation file
-                try:
-                    print("Loading entire validation file...")
-                    val_df = pd.read_parquet(val_file, columns=columns_to_load)
-                    # Convert features and targets to float32
-                    for col in features + final_targets:
-                        if col in val_df.columns:
-                            val_df[col] = val_df[col].astype(np.float32)
-                    
-                    print(f"Train shape: {train_df.shape}, Validation shape: {val_df.shape}")
-                    return train_df, val_df, features, final_targets
-                except Exception as val_load_error:
-                    print(f"Failed to load validation file: {val_load_error}")
-                    return train_df, None, features, final_targets
-            
-            # Load validation data in chunks
-            for i in range(0, val_total_rows, chunk_size):
-                print(f"Loading validation chunk {i//chunk_size + 1}/{val_num_chunks}")
-                
-                # Use safe approach with filters to load chunks
-                filters = [('__index_level_0__', '>=', i), ('__index_level_0__', '<', i + chunk_size)]
-                try:
-                    chunk = pd.read_parquet(val_file, columns=columns_to_load, filters=filters)
-                    
-                    # If the filter approach didn't work properly, use the older approach
-                    if len(chunk) == val_total_rows:
-                        print("Filter approach returned all rows, falling back to regular loading")
-                        if i == 0:
-                            # Just keep this first chunk which has all rows
-                            for col in features + final_targets:
-                                if col in chunk.columns:
-                                    chunk[col] = chunk[col].astype(np.float32)
-                            val_chunks = [chunk]
-                            break
-                        else:
-                            # We've already loaded everything on the first iteration, just break
-                            break
-                    
-                    # Convert features and targets to float32
-                    for col in features + final_targets:
-                        if col in chunk.columns:
-                            chunk[col] = chunk[col].astype(np.float32)
-                    
-                    val_chunks.append(chunk)
-                except Exception as chunk_error:
-                    print(f"Error loading validation chunk {i//chunk_size + 1}: {chunk_error}")
-                    if i == 0:
-                        # Try loading the entire validation file
-                        try:
-                            print("Loading entire validation file...")
-                            val_df = pd.read_parquet(val_file, columns=columns_to_load)
-                            # Convert features and targets to float32
-                            for col in features + final_targets:
-                                if col in val_df.columns:
-                                    val_df[col] = val_df[col].astype(np.float32)
-                            break
-                        except Exception as val_load_error:
-                            print(f"Failed to load validation file: {val_load_error}")
-                            return train_df, None, features, final_targets
-            
-            # Combine validation chunks if we have any
-            if val_chunks:
-                val_df = pd.concat(val_chunks, ignore_index=True)
-                del val_chunks
-                gc.collect()
-            
+                print(f"Error with sampling approach: {e}")
+                print("Falling back to loading full dataset and then sampling")
+                train_df = pd.read_parquet(f"{data_version}/train.parquet", columns=columns_to_load)
+                if sample_size < len(train_df):
+                    train_df = train_df.sample(n=sample_size, random_state=random_seed).reset_index(drop=True)
         else:
-            # Load entire datasets at once for smaller feature sets
-            train_df = pd.read_parquet(
-                f"{data_version}/train.parquet",
-                columns=columns_to_load,
-                dtype_backend='pyarrow'
-            )
-            
-            print("Reading validation data...")
-            val_df = pd.read_parquet(
-                f"{data_version}/validation.parquet",
-                columns=columns_to_load,
-                dtype_backend='pyarrow'
-            )
-            
-            # Convert features and targets to float32
-            print("Converting features and targets to float32...")
-            for col in features + final_targets:
+            # Load full dataset
+            train_df = pd.read_parquet(f"{data_version}/train.parquet", columns=columns_to_load)
+        
+        # Load validation data - always load in full
+        print("Reading validation data...")
+        val_df = pd.read_parquet(f"{data_version}/validation.parquet", columns=columns_to_load)
+        
+        # Convert features and targets to float32
+        print("Converting features and targets to float32...")
+        # Process in batches to avoid memory spikes
+        batch_size = 100  # Process 100 columns at a time
+        
+        # Process train features
+        for i in range(0, len(features), batch_size):
+            batch_end = min(i + batch_size, len(features))
+            batch_features = features[i:batch_end]
+            for col in batch_features:
                 if col in train_df.columns:
                     train_df[col] = train_df[col].astype(np.float32)
+            
+            # Free memory
+            gc.collect()
+            
+        # Process train targets
+        for col in final_targets:
+            if col in train_df.columns:
+                train_df[col] = train_df[col].astype(np.float32)
+        
+        # Process validation features
+        for i in range(0, len(features), batch_size):
+            batch_end = min(i + batch_size, len(features))
+            batch_features = features[i:batch_end]
+            for col in batch_features:
                 if col in val_df.columns:
                     val_df[col] = val_df[col].astype(np.float32)
-       
+            
+            # Free memory
+            gc.collect()
+        
+        # Process validation targets
+        for col in final_targets:
+            if col in val_df.columns:
+                val_df[col] = val_df[col].astype(np.float32)
+        
         print(f"Train shape: {train_df.shape}, Validation shape: {val_df.shape}")
         
         # Report memory usage
@@ -281,7 +171,7 @@ def load_data(data_version="v5.0", feature_set="small",
         print(f"Memory usage - Train: {train_memory:.2f} MB, Val: {val_memory:.2f} MB")
         
         return train_df, val_df, features, final_targets
-       
+    
     except Exception as e:
         print(f"Error loading data: {str(e)}")
         traceback.print_exc()
