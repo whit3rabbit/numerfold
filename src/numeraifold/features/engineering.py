@@ -228,21 +228,42 @@ def generate_alphafold_features(train_df, val_df, model, features, confidence_th
             
             # Convert features to float32
             X = np.array(chunk[features].fillna(0).values, dtype=np.float32)
+            
+            # Reshape data to [batch_size, num_features, 1] as expected by the model
+            X = X.reshape(X.shape[0], X.shape[1], 1)
+            
             X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
             
             with torch.no_grad():
-                # Get model outputs
-                outputs = model(X_tensor)
-                predictions = outputs['predictions'].cpu().numpy()
-                confidences = outputs['confidence'].cpu().numpy()
-                embeddings = outputs['embeddings'].cpu().numpy()
+                # Get model outputs - assuming model returns (predictions, attentions)
+                predictions, attentions = model(X_tensor)
+                
+                # Extract embeddings
+                x = model.feature_embedding(X_tensor)
+                x = x + model.pos_encoding[:, :X_tensor.size(1), :]
+                
+                for transformer in model.transformer_blocks:
+                    x, _ = transformer(x)
+                
+                x = model.output_norm(x)
+                embeddings = x.mean(dim=1).cpu().numpy()
+                
+                # Calculate confidence from attention patterns
+                if attentions and len(attentions) > 0:
+                    attention_stack = torch.stack(attentions)
+                    attention_std = attention_stack.std(dim=0).mean(dim=[1, 2])
+                    confidences = 1.0 / (1.0 + attention_std).cpu().numpy()
+                else:
+                    confidences = np.ones(len(predictions))
+                
+                predictions = predictions.cpu().numpy()
             
             all_embeddings.append(embeddings)
             all_predictions.append(predictions)
             all_confidences.append(confidences)
         
         # Combine results
-        return np.vstack(all_embeddings), np.vstack(all_predictions), np.vstack(all_confidences)
+        return np.vstack(all_embeddings), np.concatenate(all_predictions), np.concatenate(all_confidences)
     
     try:
         # Process training data
@@ -252,13 +273,35 @@ def generate_alphafold_features(train_df, val_df, model, features, confidence_th
         else:
             # Convert features to float32
             X_train = np.array(train_df[features].fillna(0).values, dtype=np.float32)
+            
+            # Reshape data to [batch_size, num_features, 1]
+            X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
+            
             X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
             
             with torch.no_grad():
-                outputs_train = model(X_train_tensor)
-                train_preds = outputs_train['predictions'].cpu().numpy()
-                train_confidences = outputs_train['confidence'].cpu().numpy()
-                train_embeddings = outputs_train['embeddings'].cpu().numpy()
+                # Get model outputs
+                train_preds, attentions = model(X_train_tensor)
+                
+                # Extract embeddings
+                x = model.feature_embedding(X_train_tensor)
+                x = x + model.pos_encoding[:, :X_train_tensor.size(1), :]
+                
+                for transformer in model.transformer_blocks:
+                    x, _ = transformer(x)
+                
+                x = model.output_norm(x)
+                train_embeddings = x.mean(dim=1).cpu().numpy()
+                
+                # Calculate confidence
+                if attentions and len(attentions) > 0:
+                    attention_stack = torch.stack(attentions)
+                    attention_std = attention_stack.std(dim=0).mean(dim=[1, 2])
+                    train_confidences = 1.0 / (1.0 + attention_std).cpu().numpy()
+                else:
+                    train_confidences = np.ones(len(train_preds))
+                
+                train_preds = train_preds.cpu().numpy()
         
         # Process validation data
         if len(val_df) > 10000:
@@ -267,13 +310,34 @@ def generate_alphafold_features(train_df, val_df, model, features, confidence_th
         else:
             # Convert features to float32
             X_val = np.array(val_df[features].fillna(0).values, dtype=np.float32)
+            
+            # Reshape data to [batch_size, num_features, 1]
+            X_val = X_val.reshape(X_val.shape[0], X_val.shape[1], 1)
+            
             X_val_tensor = torch.tensor(X_val, dtype=torch.float32).to(device)
             
             with torch.no_grad():
-                outputs_val = model(X_val_tensor)
-                val_preds = outputs_val['predictions'].cpu().numpy()
-                val_confidences = outputs_val['confidence'].cpu().numpy()
-                val_embeddings = outputs_val['embeddings'].cpu().numpy()
+                val_preds, attentions = model(X_val_tensor)
+                
+                # Extract embeddings
+                x = model.feature_embedding(X_val_tensor)
+                x = x + model.pos_encoding[:, :X_val_tensor.size(1), :]
+                
+                for transformer in model.transformer_blocks:
+                    x, _ = transformer(x)
+                
+                x = model.output_norm(x)
+                val_embeddings = x.mean(dim=1).cpu().numpy()
+                
+                # Calculate confidence
+                if attentions and len(attentions) > 0:
+                    attention_stack = torch.stack(attentions)
+                    attention_std = attention_stack.std(dim=0).mean(dim=[1, 2])
+                    val_confidences = 1.0 / (1.0 + attention_std).cpu().numpy()
+                else:
+                    val_confidences = np.ones(len(val_preds))
+                
+                val_preds = val_preds.cpu().numpy()
         
         # Create feature dataframes
         print("Creating feature dataframes...")
