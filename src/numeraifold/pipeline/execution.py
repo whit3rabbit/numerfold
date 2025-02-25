@@ -1166,6 +1166,7 @@ def follow_up_domains_pipeline(
         'feature_importance': feature_importance.head(20) if len(feature_importance) > 0 else None,
         'domain_models': {
             domain: {
+                'model': info['model'],
                 'features': info['features'],
                 'score': info['score'],
                 'weight': info['weight']
