@@ -1,23 +1,23 @@
 def load_domain_models(models_dir='domain_models'):
     """
     Load all saved domain models and their metadata
-    
+   
     Args:
         models_dir: Directory where domain models are saved
-        
+       
     Returns:
         dict: Dictionary of domain models and their metadata
     """
     import os
     import joblib
     import json
-    
+   
     if not os.path.exists(models_dir):
         print(f"Error: Models directory {models_dir} does not exist")
         return {}
-    
+   
     domain_models = {}
-    
+   
     # Load ensemble weights if available
     ensemble_weights = {}
     ensemble_weights_path = os.path.join(models_dir, 'ensemble_weights.json')
@@ -29,19 +29,19 @@ def load_domain_models(models_dir='domain_models'):
                 print(f"Loaded ensemble weights for {len(ensemble_weights)} domains")
         except Exception as e:
             print(f"Error loading ensemble weights: {e}")
-    
+   
     # Find all domain model files
     model_files = [f for f in os.listdir(models_dir) if f.endswith('_model.joblib')]
-    
+   
     for model_file in model_files:
         try:
             # Extract domain name from filename
             domain = model_file.replace('_model.joblib', '')
-            
+           
             # Load model
             model_path = os.path.join(models_dir, model_file)
             model = joblib.load(model_path)
-            
+           
             # Load metadata
             metadata_path = os.path.join(models_dir, f"{domain}_metadata.json")
             if os.path.exists(metadata_path):
@@ -55,19 +55,24 @@ def load_domain_models(models_dir='domain_models'):
                     'score': 0.0,
                     'weight': ensemble_weights.get(domain, 0.0)
                 }
-            
+           
+            # Ensure features are correctly loaded from metadata
+            if 'features' not in metadata or not metadata['features']:
+                print(f"Warning: No features found in metadata for {domain}")
+                continue
+                
             # Add model to dictionary
             domain_models[domain] = {
                 'model': model,
-                'features': metadata['features'],
+                'features': metadata['features'],  # Use features from metadata
                 'score': metadata['score'],
                 'weight': metadata.get('weight', ensemble_weights.get(domain, 0.0))
             }
             print(f"Loaded model for {domain} with {len(metadata['features'])} features")
-            
+           
         except Exception as e:
             print(f"Error loading model {model_file}: {e}")
-    
+   
     print(f"Successfully loaded {len(domain_models)} domain models")
     return domain_models
 
