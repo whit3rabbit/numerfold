@@ -6,7 +6,9 @@ including the full pipeline (feature domain identification, model training,
 feature generation, and final evaluation) and a domains-only pipeline.
 """
 
+import json
 import os
+import joblib
 import numpy as np
 import torch
 import pandas as pd
@@ -831,8 +833,206 @@ def follow_up_domains_pipeline(
         print("Falling back to original features")
         pruned_features = kept_features
 
+# Extract the prune_correlated_features function to reuse for domain-specific pruning
+    def prune_correlated_features(df, features, target_col, corr_threshold):
+        """Prune highly correlated features within a feature set"""
+        # Calculate correlation with target
+        target_correlations = {}
+        for feat in features:
+            target_correlations[feat] = robust_correlation(df[feat], df[target_col])
+        
+        # Sort by correlation with target
+        sorted_feats = sorted(target_correlations.keys(), 
+                              key=lambda x: target_correlations[x], 
+                              reverse=True)
+        
+        # Greedy feature selection
+        pruned = []
+        remaining = sorted_feats.copy()
+        
+        while remaining:
+            if not remaining:
+                break
+                
+            # Add feature with highest target correlation
+            current = remaining.pop(0)
+            pruned.append(current)
+            
+            # Find highly correlated features to remove
+            to_remove = []
+            for other in remaining:
+                corr = robust_correlation(df[current], df[other])
+                if corr > corr_threshold:
+                    to_remove.append(other)
+            
+            # Remove correlated features
+            remaining = [f for f in remaining if f not in to_remove]
+        
+        return pruned
+
     # -------------------------------------------------
-    # 4. Train a final global regression model on pruned features
+    # 4. Train domain-specific models
+    # -------------------------------------------------
+    print("\nTraining domain-specific models...")
+    domain_models = {}
+    domain_performances = {}
+    ensemble_predictions = None
+    ensemble_weights = {}
+    
+    for domain in kept_domains:
+        try:
+            # Get domain features that exist in the data
+            domain_features = [f for f in feature_groups[domain] if f in train_df.columns]
+            
+            if len(domain_features) < 5:
+                print(f"Domain {domain} has too few features ({len(domain_features)}), skipping model")
+                continue
+                
+            # Prune correlated features within this domain
+            print(f"Pruning features for domain {domain}...")
+            domain_pruned = prune_correlated_features(
+                train_df, domain_features, main_target, correlation_threshold
+            )
+            
+            if len(domain_pruned) < 5:
+                print(f"Domain {domain} has too few features after pruning ({len(domain_pruned)}), skipping model")
+                continue
+                
+            print(f"Training model for domain {domain} with {len(domain_pruned)} features")
+            
+            # Train domain-specific model
+            domain_model = LGBMRegressor(
+                n_estimators=250,
+                learning_rate=0.01,
+                max_depth=5,
+                num_leaves=25,
+                colsample_bytree=0.7,
+                subsample=0.7,
+                reg_alpha=0.1,
+                reg_lambda=0.1,
+                random_state=42
+            )
+            
+            # Prepare data
+            X_domain = train_df[domain_pruned].fillna(0).astype(np.float32)
+            y_domain = train_df[main_target].fillna(0).astype(np.float32)
+            
+            # Train model
+            domain_model.fit(X_domain, y_domain, eval_metric='rmse')
+            
+            # Evaluate model
+            if val_df is not None:
+                X_val_domain = val_df[domain_pruned].fillna(0).astype(np.float32)
+                y_val_domain = val_df[main_target].fillna(0).astype(np.float32)
+                
+                domain_preds = domain_model.predict(X_val_domain)
+                domain_score = robust_correlation(y_val_domain.values, domain_preds)
+                
+                # Calculate ensemble weight based on domain score
+                weight = max(0, domain_score)  # Use validation score as weight
+                
+                # Store predictions for ensemble
+                if ensemble_predictions is None:
+                    ensemble_predictions = np.zeros_like(domain_preds)
+                
+                # Add weighted predictions to ensemble
+                if weight > 0:
+                    ensemble_predictions += weight * domain_preds
+                    ensemble_weights[domain] = weight
+            else:
+                # Evaluate on training data if no validation set
+                domain_preds = domain_model.predict(X_domain)
+                domain_score = robust_correlation(y_domain.values, domain_preds)
+                weight = max(0, domain_score)
+            
+            print(f"Domain {domain} model score: {domain_score:.4f}, weight: {weight:.4f}")
+            
+            # Calculate feature importance
+            domain_importance = pd.DataFrame({
+                'feature': domain_pruned,
+                'importance': domain_model.feature_importances_
+            }).sort_values('importance', ascending=False)
+            
+            # Store domain model info
+            domain_models[domain] = {
+                'model': domain_model,
+                'features': domain_pruned,
+                'score': domain_score,
+                'weight': weight,
+                'importance': domain_importance
+            }
+            domain_performances[domain] = domain_score
+            
+            # Save model to disk
+            try:
+                import joblib
+                import os
+                
+                # Create directories if they don't exist
+                os.makedirs('domain_models', exist_ok=True)
+                
+                # Save model
+                joblib.dump(domain_model, f'domain_models/{domain}_model.joblib')
+                
+                # Save features and metadata
+                with open(f'domain_models/{domain}_metadata.json', 'w') as f:
+                    json.dump({
+                        'domain': domain,
+                        'features': domain_pruned,
+                        'score': float(domain_score),
+                        'weight': float(weight),
+                        'importance': [
+                            {'feature': feat, 'importance': float(imp)}
+                            for feat, imp in zip(domain_importance['feature'], domain_importance['importance'])
+                        ]
+                    }, f, indent=2)
+                
+                print(f"Saved model and metadata for domain {domain}")
+                
+            except Exception as save_error:
+                print(f"Error saving domain model: {save_error}")
+        
+        except Exception as domain_error:
+            print(f"Error training model for domain {domain}: {domain_error}")
+    
+    # -------------------------------------------------
+    # 5. Create ensemble model
+    # -------------------------------------------------
+    ensemble_score = 0.0
+    spearman_ensemble = 0.0
+    
+    if val_df is not None and ensemble_predictions is not None:
+        # Normalize ensemble predictions
+        total_weight = sum(ensemble_weights.values())
+        if total_weight > 0:
+            ensemble_predictions /= total_weight
+            
+            # Calculate ensemble performance
+            ensemble_score = robust_correlation(val_df[main_target].values, ensemble_predictions)
+            
+            # Calculate Spearman correlation
+            from scipy.stats import spearmanr
+            spearman_ensemble = spearmanr(val_df[main_target].values, ensemble_predictions)[0]
+            
+            print(f"\nEnsemble model performance:")
+            print(f"Ensemble correlation score: {ensemble_score:.4f}")
+            print(f"Ensemble Spearman correlation: {spearman_ensemble:.4f}")
+            
+            # Save ensemble weights
+            try:
+                with open('domain_models/ensemble_weights.json', 'w') as f:
+                    json.dump({
+                        'domains': {k: float(v) for k, v in ensemble_weights.items()},
+                        'total_weight': float(total_weight),
+                        'correlation': float(ensemble_score),
+                        'spearman': float(spearman_ensemble)
+                    }, f, indent=2)
+                print("Saved ensemble weights")
+            except Exception as e:
+                print(f"Error saving ensemble weights: {e}")
+
+    # -------------------------------------------------
+    # 6. Train a final global regression model on pruned features
     # -------------------------------------------------
     print("\nTraining final global regression model with pruned features...")
     try:
@@ -885,6 +1085,24 @@ def follow_up_domains_pipeline(
             eval_metric='rmse'
         )
         
+        # Save final model
+        try:           
+            os.makedirs('models', exist_ok=True)
+            joblib.dump(final_model, 'models/final_model.joblib')
+            
+            # Save features and metadata
+            with open('models/final_model_metadata.json', 'w') as f:
+                json.dump({
+                    'features': pruned_features,
+                    'domains_used': kept_domains,
+                    'score': float(final_score) if 'final_score' in locals() else 0.0,
+                    'spearman': float(spearman_corr) if 'spearman_corr' in locals() else 0.0
+                }, f, indent=2)
+            
+            print("Saved final model and metadata")
+        except Exception as save_error:
+            print(f"Error saving final model: {save_error}")
+        
         # Generate predictions and calculate correlation
         if val_df is not None:
             # Prepare validation data
@@ -902,6 +1120,13 @@ def follow_up_domains_pipeline(
             from scipy.stats import spearmanr
             spearman_corr = spearmanr(y_val.values, val_preds)[0]
             print(f"Spearman correlation: {spearman_corr:.4f}")
+            
+            # Compare with ensemble
+            if ensemble_score > 0:
+                if ensemble_score > final_score:
+                    print(f"Ensemble model outperforms global model: {ensemble_score:.4f} vs {final_score:.4f}")
+                else:
+                    print(f"Global model outperforms ensemble: {final_score:.4f} vs {ensemble_score:.4f}")
         else:
             # No validation data, use training data for evaluation
             print("No validation data provided, evaluating on training data")
@@ -930,7 +1155,7 @@ def follow_up_domains_pipeline(
         feature_importance = pd.DataFrame({'feature': pruned_features, 'importance': 0.0})
 
     # -------------------------------------------------
-    # 5. Return results
+    # 7. Return results
     # -------------------------------------------------
     results = {
         'domain_scores': domain_scores,
@@ -938,7 +1163,17 @@ def follow_up_domains_pipeline(
         'pruned_features': pruned_features,
         'final_model_score': final_score,
         'spearman_correlation': spearman_corr,
-        'feature_importance': feature_importance.head(20) if len(feature_importance) > 0 else None
+        'feature_importance': feature_importance.head(20) if len(feature_importance) > 0 else None,
+        'domain_models': {
+            domain: {
+                'features': info['features'],
+                'score': info['score'],
+                'weight': info['weight']
+            } for domain, info in domain_models.items()
+        },
+        'ensemble_score': ensemble_score,
+        'ensemble_spearman': spearman_ensemble,
+        'ensemble_weights': ensemble_weights
     }
     return results
 
