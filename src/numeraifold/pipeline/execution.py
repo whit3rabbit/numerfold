@@ -13,6 +13,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import traceback
 import umap
+import gc
 import os
 from lightgbm import LGBMRegressor
 import traceback
@@ -1127,5 +1128,478 @@ def extract_feature_domains_only(train_df, features, n_clusters=10,
             }
     except Exception as e:
         print(f"Domain extraction failed: {e}")
+        traceback.print_exc()
+        return {'error': str(e)}
+
+def run_domains_only_pipeline(
+    data_version: str = "v5.0",
+    feature_set: str = "medium",
+    main_target: str = "target",
+    num_aux_targets: int = 3,
+    aux_targets: Optional[List[str]] = None,
+    sample_size: Optional[int] = None,
+    n_clusters: Optional[int] = None,  # if None, dynamic clustering will determine optimal clusters
+    save_path: str = 'feature_domains_data.csv',
+    chunk_size: int = 10000,
+    use_incremental: bool = True,
+    skip_visualizations: bool = False,
+    random_seed: int = 42
+) -> Dict:
+    """
+    Enhanced domain pipeline with proper float32 conversion and memory optimization.
+    
+    Args:
+        data_version: Version of dataset
+        feature_set: Size of feature set (small, medium, large)
+        main_target: Primary target column
+        num_aux_targets: Number of auxiliary targets to use
+        aux_targets: Specific auxiliary targets to use (overrides num_aux_targets)
+        sample_size: Number of samples to use (None for all)
+        n_clusters: Number of clusters (None for automatic determination)
+        save_path: Path to save domain data
+        chunk_size: Size of chunks for processing large datasets
+        use_incremental: Whether to use incremental processing for large datasets
+        skip_visualizations: Whether to skip generating visualizations
+        random_seed: Random seed for reproducibility
+        
+    Returns:
+        Dict containing domain information
+    """
+    print(f"Starting enhanced domain pipeline with {feature_set} feature set")
+    log_memory_usage("Initial")
+    results = {}
+
+    try:
+        # ---------------------------
+        # 1. Data Loading & Preparation with float32 conversion
+        # ---------------------------
+        print("Loading data with explicit float32 conversion...")
+        
+        # Set memory optimization flags based on dataset size
+        if feature_set == "large":
+            use_incremental = True
+            print("Large feature set detected, enabling incremental processing")
+        
+        if aux_targets is not None:
+            print(f"Using specified auxiliary targets: {aux_targets}")
+            train_df, val_df, features, all_targets = load_data(
+                data_version=data_version,
+                feature_set=feature_set,
+                main_target=main_target,
+                aux_targets=aux_targets,  # Pass the aux_targets directly
+                num_aux_targets=0  # Set to 0 to prevent random selection
+            )
+            # Check if all specified targets are in the loaded data
+            available_targets = [col for col in train_df.columns if col.startswith('target_')]
+            print(f"Available targets: {available_targets}")
+            missing_targets = [t for t in aux_targets if t not in train_df.columns]
+            if missing_targets:
+                raise ValueError(f"Specified auxiliary targets not found in data: {missing_targets}")
+            all_targets = [main_target] + aux_targets  # Use the specified targets
+        else:
+            print(f"Selecting {num_aux_targets} random auxiliary targets")
+            train_df, val_df, features, all_targets = load_data(
+                data_version=data_version,
+                feature_set=feature_set,
+                main_target=main_target,
+                num_aux_targets=num_aux_targets
+            )
+        
+        if train_df is None or val_df is None:
+            raise ValueError("Failed to load data")
+            
+        print(f"Loaded data with {len(features)} features")
+        print(f"Using targets: {all_targets}")
+        print(f"Train shape: {train_df.shape}, Val shape: {val_df.shape}")
+        
+        # Explicitly convert features and targets to float32
+        print("Converting features and targets to float32...")
+        for feature in features:
+            if feature in train_df.columns:
+                train_df[feature] = train_df[feature].astype(np.float32)
+            if feature in val_df.columns:
+                val_df[feature] = val_df[feature].astype(np.float32)
+                
+        for target in all_targets:
+            if target in train_df.columns:
+                train_df[target] = train_df[target].astype(np.float32)
+            if target in val_df.columns:
+                val_df[target] = val_df[target].astype(np.float32)
+        
+        log_memory_usage("After data type conversion")
+
+        # Apply sampling if specified
+        if sample_size is not None and sample_size < len(train_df):
+            print(f"Sampling {sample_size} rows from training data")
+            train_df = train_df.sample(n=sample_size, random_state=random_seed)
+        
+        # ---------------------------
+        # 2. Memory-Efficient Correlation Computation
+        # ---------------------------
+        print("Computing feature-target correlations with memory optimization...")
+        
+        if use_incremental and len(features) * len(all_targets) > 10000:
+            print("Using incremental correlation computation for large feature set")
+            # Process in batches to avoid memory issues
+            batch_size = min(500, len(features))
+            correlations = []
+            
+            for i in range(0, len(features), batch_size):
+                batch_features = features[i:i+batch_size]
+                batch_corrs = []
+                
+                for feature in batch_features:
+                    feature_corrs = []
+                    # Handle NaNs by filling with 0
+                    feature_data = train_df[feature].fillna(0).values.astype(np.float32)
+                    
+                    for target in all_targets:
+                        target_data = train_df[target].fillna(0).values.astype(np.float32)
+                        # Use memory-efficient correlation calculation
+                        corr = np.corrcoef(feature_data, target_data)[0, 1]
+                        feature_corrs.append(corr)
+                    
+                    batch_corrs.append(feature_corrs)
+                
+                correlations.extend(batch_corrs)
+                
+                # Free memory after each batch
+                gc.collect()
+                log_memory_usage(f"After batch {i//batch_size + 1}/{(len(features) + batch_size - 1)//batch_size}")
+        else:
+            # Standard processing for smaller datasets
+            correlations = []
+            for feature in features:
+                feature_corrs = []
+                for target in all_targets:
+                    # Handle NaNs by filling with 0
+                    feature_data = train_df[feature].fillna(0).values.astype(np.float32)
+                    target_data = train_df[target].fillna(0).values.astype(np.float32)
+                    corr = np.corrcoef(feature_data, target_data)[0, 1]
+                    feature_corrs.append(corr)
+                correlations.append(feature_corrs)
+        
+        correlations = np.array(correlations, dtype=np.float32)
+        print(f"Correlation matrix shape: {correlations.shape}")
+        
+        # ---------------------------
+        # 3. Enhanced Embeddings using t-SNE with memory optimization
+        # ---------------------------
+        print("Applying t-SNE for enhanced feature embeddings...")
+        # Free memory before t-SNE
+        gc.collect()
+        log_memory_usage("Before t-SNE")
+        
+        # Use early_exaggeration=4.0 for memory optimization
+        tsne = TSNE(
+            n_components=3, 
+            perplexity=min(30, len(features) - 1),  # Adjust perplexity for small feature sets
+            random_state=random_seed,
+            n_jobs=-1,  # Use all available cores
+            early_exaggeration=4.0,  # Lower value for memory optimization
+            method='barnes_hut' if len(features) > 1000 else 'exact'  # Memory-efficient for large sets
+        )
+        feature_embeddings = tsne.fit_transform(correlations)
+        feature_embeddings = feature_embeddings.astype(np.float32)  # Ensure float32
+        print(f"Feature embeddings shape: {feature_embeddings.shape}")
+        
+        # Free memory after t-SNE
+        del correlations
+        gc.collect()
+        log_memory_usage("After t-SNE")
+
+        # ---------------------------
+        # 4. Dynamic Cluster Determination with memory optimization
+        # ---------------------------
+        if n_clusters is None:
+            print("Determining optimal number of clusters dynamically using silhouette scores...")
+            silhouette_scores = []
+            
+            # Adjust k range based on feature set size
+            if len(features) < 100:
+                k_range = range(max(3, len(features) // 10), min(15, len(features) // 2))
+            elif len(features) < 500:
+                k_range = range(10, 20)
+            else:
+                k_range = range(15, 30)
+                
+            for k in k_range:
+                # Use batch_size=None for small datasets, otherwise use memory-efficient MiniBatchKMeans
+                if len(features) < 1000:
+                    clusterer = KMeans(n_clusters=k, random_state=random_seed, n_init=5)
+                else:
+                    from sklearn.cluster import MiniBatchKMeans
+                    clusterer = MiniBatchKMeans(
+                        n_clusters=k, 
+                        random_state=random_seed,
+                        batch_size=min(1000, len(features)),
+                        n_init=3
+                    )
+                    
+                labels = clusterer.fit_predict(feature_embeddings)
+                score = silhouette_score(feature_embeddings, labels)
+                silhouette_scores.append(score)
+                print(f"Silhouette score for k={k}: {score:.4f}")
+                
+                # Free memory after each iteration
+                gc.collect()
+                
+            optimal_k = k_range[np.argmax(silhouette_scores)]
+            n_clusters = optimal_k
+            print(f"Optimal number of clusters determined: {n_clusters}")
+        else:
+            print(f"Using user-specified number of clusters: {n_clusters}")
+
+        # ---------------------------
+        # 5. Memory-Efficient Clustering
+        # ---------------------------
+        print(f"Clustering features into {n_clusters} domains...")
+        
+        # Use appropriate clustering algorithm based on dataset size
+        if len(features) < 1000:
+            clusterer = KMeans(
+                n_clusters=n_clusters, 
+                random_state=random_seed,
+                n_init=10
+            )
+        else:
+            from sklearn.cluster import MiniBatchKMeans
+            clusterer = MiniBatchKMeans(
+                n_clusters=n_clusters, 
+                random_state=random_seed,
+                batch_size=min(1000, len(features)),
+                n_init=3
+            )
+            
+        cluster_labels = clusterer.fit_predict(feature_embeddings)
+
+        # Create feature groups (domains)
+        feature_groups = defaultdict(list)
+        for idx, label in enumerate(cluster_labels):
+            domain_name = f"domain_{label}"
+            feature_groups[domain_name].append(features[idx])
+        feature_groups = dict(feature_groups)
+        
+        # Print domain sizes
+        print("Domain sizes:")
+        for domain, domain_features in feature_groups.items():
+            print(f"  {domain}: {len(domain_features)} features")
+
+        # ---------------------------
+        # 6. Save Domain Data
+        # ---------------------------
+        results['feature_groups'] = feature_groups
+        results['num_domains'] = len(feature_groups)
+        results['targets_used'] = all_targets
+        results['embeddings_shape'] = feature_embeddings.shape
+
+        try:
+            print("Saving domain data...")
+            # Create domain data in batches if there are many features
+            if len(features) > 10000:
+                print("Creating domain data in batches...")
+                domains_df_list = []
+                batch_size = 5000
+                
+                for i in range(0, len(features), batch_size):
+                    batch_domain_data = []
+                    batch_end = min(i + batch_size, len(features))
+                    
+                    for idx in range(i, batch_end):
+                        batch_domain_data.append({
+                            'feature': features[idx],
+                            'domain_id': int(cluster_labels[idx]),
+                            'domain_name': f"domain_{int(cluster_labels[idx])}",
+                            **{f'dimension_{i+1}': emb.item() for i, emb in enumerate(feature_embeddings[idx])}
+                        })
+                    
+                    domains_df_list.append(pd.DataFrame(batch_domain_data))
+                    
+                # Concatenate all batches
+                domains_df = pd.concat(domains_df_list, ignore_index=True)
+            else:
+                # Standard processing for smaller datasets
+                domain_data = []
+                for idx, feature in enumerate(features):
+                    domain_data.append({
+                        'feature': feature,
+                        'domain_id': int(cluster_labels[idx]),
+                        'domain_name': f"domain_{int(cluster_labels[idx])}",
+                        **{f'dimension_{i+1}': emb for i, emb in enumerate(feature_embeddings[idx])}
+                    })
+                domains_df = pd.DataFrame(domain_data)
+            
+            domains_df.to_csv(save_path, index=False)
+            results['domains_saved_path'] = save_path
+            print(f"Domain data saved to: {save_path}")
+            
+            # Save a summary file with domain statistics
+            summary_path = save_path.replace('.csv', '_summary.csv')
+            domain_summary = []
+            for domain_id in range(n_clusters):
+                domain_features = [features[i] for i, label in enumerate(cluster_labels) if label == domain_id]
+                domain_summary.append({
+                    'domain_id': domain_id,
+                    'domain_name': f"domain_{domain_id}",
+                    'feature_count': len(domain_features),
+                    'sample_features': ", ".join(domain_features[:5]) + ("..." if len(domain_features) > 5 else "")
+                })
+            pd.DataFrame(domain_summary).to_csv(summary_path, index=False)
+            results['domain_summary_path'] = summary_path
+            
+        except Exception as save_error:
+            print(f"Error saving domain data: {save_error}")
+            results['save_error'] = str(save_error)
+        
+        # ---------------------------
+        # 7. Memory-Efficient Cluster Validation
+        # ---------------------------
+        print("Computing intra-domain correlation matrix...")
+        
+        # Use memory-efficient approach for large datasets
+        if len(features) > 5000 or len(train_df) > 50000:
+            print("Using memory-efficient domain validation approach")
+            
+            # Process one domain at a time
+            domain_corr_matrix = np.zeros((n_clusters, len(all_targets)), dtype=np.float32)
+            
+            for domain_id in range(n_clusters):
+                domain_features = [features[i] for i, label in enumerate(cluster_labels) if label == domain_id]
+                
+                if len(domain_features) == 0:
+                    continue
+                    
+                # Process one target at a time
+                for j, target in enumerate(all_targets):
+                    # Calculate correlations in mini-batches
+                    batch_size = min(200, len(domain_features))
+                    domain_corrs = []
+                    
+                    for k in range(0, len(domain_features), batch_size):
+                        batch_features = domain_features[k:k+batch_size]
+                        batch_corrs = []
+                        
+                        for feat in batch_features:
+                            if feat in train_df.columns and target in train_df.columns:
+                                feat_data = train_df[feat].fillna(0).values.astype(np.float32)
+                                target_data = train_df[target].fillna(0).values.astype(np.float32)
+                                corr = np.corrcoef(feat_data, target_data)[0, 1]
+                                batch_corrs.append(corr)
+                        
+                        domain_corrs.extend(batch_corrs)
+                        
+                    # Calculate mean correlation for this domain-target pair
+                    if domain_corrs:
+                        domain_corr_matrix[domain_id, j] = np.mean(domain_corrs)
+                    else:
+                        domain_corr_matrix[domain_id, j] = 0
+                        
+                # Free memory after processing each domain
+                gc.collect()
+        else:
+            # Standard approach for smaller datasets
+            domain_corr_matrix = np.zeros((n_clusters, len(all_targets)))
+            for domain_id in range(n_clusters):
+                domain_features = [features[i] for i, label in enumerate(cluster_labels) if label == domain_id]
+                for j, target in enumerate(all_targets):
+                    corrs = []
+                    for feat in domain_features:
+                        if feat in train_df.columns and target in train_df.columns:
+                            feat_data = train_df[feat].fillna(0).values.astype(np.float32)
+                            target_data = train_df[target].fillna(0).values.astype(np.float32)
+                            corr = np.corrcoef(feat_data, target_data)[0, 1]
+                            corrs.append(corr)
+                    if corrs:
+                        domain_corr_matrix[domain_id, j] = np.mean(corrs)
+        
+        # Save validation results
+        results['domain_validation'] = domain_corr_matrix.tolist()
+        
+        # Free memory before visualization
+        gc.collect()
+        log_memory_usage("Before visualization")
+        
+        # ---------------------------
+        # 8. Memory-Efficient Visualizations
+        # ---------------------------
+        if not skip_visualizations:
+            try:
+                print("Generating memory-efficient visualizations...")
+                
+                # Select a subset of features for visualization if dataset is very large
+                if len(features) > 5000:
+                    print(f"Subsampling {min(5000, len(features))} features for visualization")
+                    indices = np.random.choice(len(features), size=min(5000, len(features)), replace=False)
+                    vis_embeddings = feature_embeddings[indices]
+                    vis_labels = cluster_labels[indices]
+                else:
+                    vis_embeddings = feature_embeddings
+                    vis_labels = cluster_labels
+                
+                # Use UMAP with memory-efficient settings
+                if len(vis_embeddings) > 1000:
+                    print("Using memory-optimized UMAP settings")
+                    reducer = umap.UMAP(
+                        n_neighbors=min(15, len(vis_embeddings) // 10),
+                        min_dist=0.1,
+                        metric='euclidean',
+                        random_state=random_seed,
+                        n_jobs=-1  # Use all available cores
+                    )
+                else:
+                    reducer = umap.UMAP(random_state=random_seed)
+                
+                # Convert to float32 for memory efficiency
+                vis_embeddings = vis_embeddings.astype(np.float32)
+                
+                # Generate 2D embeddings
+                umap_embeddings = reducer.fit_transform(vis_embeddings)
+                
+                # Create visualization
+                plt.figure(figsize=(10, 8))
+                scatter = plt.scatter(
+                    umap_embeddings[:, 0], 
+                    umap_embeddings[:, 1],
+                    c=vis_labels, 
+                    cmap='tab20', 
+                    s=10,
+                    alpha=0.7
+                )
+                plt.colorbar(scatter)
+                plt.title(f"Feature Domains Visualization - {len(feature_groups)} Clusters")
+                
+                # Add legend with domain sizes
+                domain_sizes = {}
+                for domain_id in range(n_clusters):
+                    count = np.sum(cluster_labels == domain_id)
+                    domain_sizes[f"Domain {domain_id}"] = count
+                
+                # Sort by size and add top 10 domains to legend
+                top_domains = dict(sorted(domain_sizes.items(), key=lambda x: x[1], reverse=True)[:10])
+                plt.figtext(0.02, 0.02, "Top domains by size:", fontsize=8)
+                y_pos = 0.05
+                for domain, size in top_domains.items():
+                    plt.figtext(0.02, y_pos, f"{domain}: {size} features", fontsize=7)
+                    y_pos += 0.02
+                
+                # Save the plot
+                plot_path = save_path.replace('.csv', '_plot.png')
+                plt.savefig(plot_path, dpi=120, bbox_inches='tight')
+                plt.close()
+                results['plot_path'] = plot_path
+                                
+                print("Visualizations generated successfully")
+            except Exception as viz_error:
+                print(f"Error generating visualizations: {viz_error}")
+                results['visualization_error'] = str(viz_error)
+        
+        # Final memory cleanup
+        gc.collect()
+        log_memory_usage("Final")
+        
+        return results
+
+    except Exception as e:
+        print(f"Pipeline error: {e}")
         traceback.print_exc()
         return {'error': str(e)}
