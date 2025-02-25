@@ -15,7 +15,9 @@ import pandas as pd
 import numpy as np
 from scipy.stats import pearsonr, skew
 from tqdm import tqdm
-
+from sklearn.metrics import roc_auc_score
+from lightgbm import LGBMClassifier
+from feature_engine.selection import SmartCorrelatedSelection
 
 def analyze_domain_relationships(train_df, features, cluster_labels, targets=None,
                                  output_path='domain_relationships.csv'):
@@ -242,12 +244,6 @@ def create_evolutionary_profiles(df, features, target_col="target", era_col='era
                 continue
 
     return profiles
-
-import numpy as np
-import pandas as pd
-from sklearn.metrics import roc_auc_score
-from lightgbm import LGBMClassifier
-from feature_engine.selection import SmartCorrelatedSelection
 
 def evaluate_domain_performance(train_df, val_df, domain_features, target_col):
     """

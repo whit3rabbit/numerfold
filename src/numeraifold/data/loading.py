@@ -5,6 +5,7 @@ This module provides functions to load and process data for a machine learning p
 It includes functions to download datasets if missing, load data with memory-efficient
 settings, process data in batches for model inference, and create properly formatted model inputs.
 """
+
 import os
 import json
 import pandas as pd
@@ -12,30 +13,15 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import pyarrow.parquet as pq
-import pyarrow as pa
-from numerapi import NumerAPI
 import gc
+from numerapi import NumerAPI
 
+from numeraifold.utils.logging import log_memory_usage
 
 def load_data(data_version="v5.0", feature_set="small",
-              main_target="target", aux_targets=None, num_aux_targets=5,
-              convert_dtypes=True, chunk_size=None, max_rows=None):
+              main_target="target", aux_targets=None, num_aux_targets=5):
     """
     Load data with memory-efficient settings and robust target handling.
-    Optimized for minimal memory usage through schema-aware loading and batch processing.
-    
-    Parameters:
-        data_version (str): Identifier for the data version/folder
-        feature_set (str): Feature set key to use ('small', 'medium', 'all')
-        main_target (str): Primary target column name
-        aux_targets (list): Optional list of specific auxiliary targets to include
-        num_aux_targets (int): Number of random auxiliary targets to include if aux_targets not specified
-        convert_dtypes (bool): If True, converts PyArrow dtypes to standard Python/NumPy types
-        chunk_size (int): If provided, process data in chunks of this size to save memory
-        max_rows (int): If provided, limit the number of rows loaded
-    
-    Returns:
-        tuple: (train_df, val_df, features, all_targets)
     """
     print(f"Loading {data_version} data with {feature_set} feature set...")
     
@@ -52,12 +38,11 @@ def load_data(data_version="v5.0", feature_set="small",
         feature_metadata = json.load(f)
     features = feature_metadata["feature_sets"][feature_set]
 
-    # Get schema and available targets
+    # Get available targets from schema without printing
     schema = pq.read_schema(f"{data_version}/train.parquet")
-    all_columns = schema.names
-    available_targets = [col for col in all_columns if col.startswith('target')]
+    available_targets = [col for col in schema.names if col.startswith('target')]
     
-    # Validate and process main target
+    # Validate all targets before loading
     if main_target not in available_targets:
         print(f"Warning: {main_target} not found in dataset. Using first available target.")
         main_target = available_targets[0] if available_targets else None
@@ -66,202 +51,51 @@ def load_data(data_version="v5.0", feature_set="small",
         print("No valid main target found. Please check the dataset.")
         return None, None, features, []
 
-    # Build final target list
+    # Validate aux_targets if provided
+    final_targets = [main_target]
     if aux_targets is not None:
-        final_targets = [main_target] + [t for t in aux_targets if t != main_target]
+        missing_targets = [t for t in aux_targets if t not in available_targets]
+        if missing_targets:
+            print(f"Error: The following auxiliary targets are not available: {missing_targets}")
+            print("Available targets:", [t for t in available_targets if t.startswith('target_')])
+            return None, None, features, []
+        final_targets.extend([t for t in aux_targets if t != main_target])
     else:
+        # Use random auxiliary targets
         remaining_targets = [t for t in available_targets if t != main_target]
         if num_aux_targets > 0:
             num_to_add = min(num_aux_targets, len(remaining_targets))
             if num_to_add < num_aux_targets:
                 print(f"Warning: Only {num_to_add} additional targets available")
             selected = np.random.choice(remaining_targets, size=num_to_add, replace=False)
-            final_targets = [main_target] + list(selected)
-        else:
-            final_targets = [main_target]
+            final_targets.extend(selected)
 
     print(f"Using targets: {final_targets}")
     
     # Load data with memory efficiency
-    columns_to_load = ["era"] + features + final_targets
-    print(f"Reading train data with {len(features)} features and {len(final_targets)} targets...")
-    
-    # Create optimized schema for dtype conversion
-    if convert_dtypes:
-        modified_fields = []
-        for field in schema:
-            if field.name in columns_to_load:
-                if field.name == 'era':
-                    modified_fields.append(field)
-                else:
-                    # Check if the field type is numeric
-                    if pa.types.is_integer(field.type) or pa.types.is_floating(field.type) or pa.types.is_decimal(field.type):
-                        modified_fields.append(pa.field(field.name, pa.float32()))
-                    else:
-                        modified_fields.append(field)
-        optimized_schema = pa.schema(modified_fields)
-    else:
-        optimized_schema = None
-
-    # Memory-optimized loading strategy
-    if chunk_size is not None:
-        print(f"Loading and processing data in chunks of {chunk_size} rows")
-        load_params = {
-            "filepath": f"{data_version}/train.parquet",
-            "columns": columns_to_load,
-            "chunk_size": chunk_size,
-            "max_rows": max_rows,
-            "convert_dtypes": convert_dtypes,
-            "optimized_schema": optimized_schema
-        }
-        train_df = load_data_in_chunks(**load_params)
+    try:
+        columns_to_load = ["era"] + features + final_targets
+        print(f"Reading train data with {len(features)} features and {len(final_targets)} targets...")
         
-        print("Reading validation data in chunks...")
-        load_params["filepath"] = f"{data_version}/validation.parquet"
-        val_df = load_data_in_chunks(**load_params)
-    else:
-        # Single-pass optimized loading
-        read_params = {
-            "columns": columns_to_load,
-            "schema": optimized_schema if convert_dtypes else None
-        }
+        train_df = pd.read_parquet(
+            f"{data_version}/train.parquet",
+            columns=columns_to_load,
+            dtype_backend='pyarrow'
+        )
         
-        # Handle max_rows efficiently for non-chunked loading
-        if max_rows:
-            train_table = read_table_with_row_cap(f"{data_version}/train.parquet", max_rows, **read_params)
-            val_table = read_table_with_row_cap(f"{data_version}/validation.parquet", max_rows, **read_params)
-        else:
-            train_table = pq.read_table(f"{data_version}/train.parquet", **read_params)
-            val_table = pq.read_table(f"{data_version}/validation.parquet", **read_params)
+        print("Reading validation data...")
+        val_df = pd.read_parquet(
+            f"{data_version}/validation.parquet",
+            columns=columns_to_load,
+            dtype_backend='pyarrow'
+        )
         
-        train_df = train_table.to_pandas()
-        val_df = val_table.to_pandas()
-
-    print(f"Train shape: {train_df.shape}, Validation shape: {val_df.shape}")
-    return train_df, val_df, features, final_targets
-
-
-def load_data_in_chunks(filepath, columns, chunk_size=10000, max_rows=None,
-                        convert_dtypes=True, optimized_schema=None):
-    """Memory-optimized chunked loading using PyArrow's batch-wise reading"""
-    parquet_file = pq.ParquetFile(filepath)
-    total_rows = min(parquet_file.metadata.num_rows, max_rows) if max_rows else parquet_file.metadata.num_rows
-    
-    chunks = []
-    rows_processed = 0
-
-    # Check if iter_batches is available in the PyArrow version
-    if hasattr(parquet_file, 'iter_batches'):
-        # Modern PyArrow with streaming API
-        for batch in parquet_file.iter_batches(
-            columns=columns,
-            batch_size=chunk_size,
-            schema=optimized_schema if convert_dtypes else None
-        ):
-            if rows_processed >= total_rows:
-                break
-                
-            # Convert batch to pandas
-            df = batch.to_pandas()
-            
-            # Handle remaining rows if we're near max_rows
-            remaining = total_rows - rows_processed
-            if len(df) > remaining:
-                df = df.iloc[:remaining]
-            
-            chunks.append(df)
-            rows_processed += len(df)
-    else:
-        # Fallback for older PyArrow versions
-        for row_group in range(parquet_file.num_row_groups):
-            if rows_processed >= total_rows:
-                break
-                
-            # Read row group
-            batch = parquet_file.read_row_group(row_group, columns=columns)
-            
-            # Apply optimized schema conversion if needed
-            if convert_dtypes and optimized_schema:
-                for col in batch.column_names:
-                    if col == 'era':
-                        continue
-                    field_type = batch.schema.field(col).type
-                    if (pa.types.is_integer(field_type) or 
-                        pa.types.is_floating(field_type) or 
-                        pa.types.is_decimal(field_type)):
-                        batch = batch.set_column(
-                            batch.column_names.index(col),
-                            col,
-                            batch[col].cast(pa.float32())
-                        )
-            
-            df = batch.to_pandas()
-            
-            # Process in smaller chunks if row group is larger than chunk_size
-            start_idx = 0
-            while start_idx < len(df):
-                end_idx = min(start_idx + chunk_size, len(df))
-                remaining = total_rows - rows_processed
-                
-                if remaining <= 0:
-                    break
-                    
-                # Slice the dataframe to respect both chunk_size and max_rows
-                slice_size = min(end_idx - start_idx, remaining)
-                chunk_df = df.iloc[start_idx:start_idx + slice_size]
-                
-                chunks.append(chunk_df)
-                rows_processed += len(chunk_df)
-                start_idx += chunk_size
-                
-                if rows_processed >= total_rows:
-                    break
+        print(f"Train shape: {train_df.shape}, Validation shape: {val_df.shape}")
+        return train_df, val_df, features, final_targets
         
-    return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
-
-
-def read_table_with_row_cap(path, max_rows, **read_kwargs):
-    """Read parquet table up to max_rows using row group optimization"""
-    parquet_file = pq.ParquetFile(path)
-    total_rows = 0
-    row_groups = []
-
-    for rg_idx in range(parquet_file.num_row_groups):
-        rg_rows = parquet_file.metadata.row_group(rg_idx).num_rows
-        if total_rows + rg_rows > max_rows:
-            break
-        row_groups.append(rg_idx)
-        total_rows += rg_rows
-
-    # Read full row groups
-    if not row_groups:
-        # Handle case where max_rows is less than first row group size
-        partial_table = parquet_file.read_row_group(0, **read_kwargs).slice(0, max_rows)
-        return partial_table
-    
-    table = parquet_file.read_row_groups(row_groups, **read_kwargs)
-    
-    # Read partial last row group if needed
-    if total_rows < max_rows and len(row_groups) < parquet_file.num_row_groups:
-        partial_rows = max_rows - total_rows
-        last_rg_idx = len(row_groups)
-        try:
-            # Try to read with row_groups API (newer PyArrow)
-            partial_table = parquet_file.read_row_groups(
-                [last_rg_idx], 
-                **read_kwargs
-            ).slice(0, partial_rows)
-            table = pa.concat_tables([table, partial_table])
-        except (AttributeError, NotImplementedError):
-            # Fallback for older PyArrow versions
-            partial_table = parquet_file.read_row_group(
-                last_rg_idx,
-                **read_kwargs
-            ).slice(0, partial_rows)
-            table = pa.concat_tables([table, partial_table])
-    
-    return table
-
+    except Exception as e:
+        print(f"Error loading data: {str(e)}")
+        return None, None, features, []
 
 def process_in_batches(df, model, features, device='cuda' if torch.cuda.is_available() else 'cpu'):
     """
@@ -422,3 +256,164 @@ def create_model_inputs(df, features, era_col='era', dtype=np.float32):
     feature_data = feature_data.reshape(feature_data.shape[0], feature_data.shape[1], 1)
 
     return feature_data
+
+
+def optimize_dataframe(df, features=None, target=None, inplace=False):
+    """
+    Optimize a pandas DataFrame's memory usage by converting to appropriate dtypes.
+    
+    Args:
+        df: DataFrame to optimize
+        features: List of feature column names to convert to float32
+        target: Target column name to convert to float32
+        inplace: Whether to modify the DataFrame in place
+        
+    Returns:
+        Optimized DataFrame
+    """
+    if not inplace:
+        df = df.copy()
+    
+    # Convert specific features to float32
+    if features is not None:
+        for col in features:
+            if col in df.columns:
+                df[col] = df[col].astype(np.float32)
+    
+    # Convert target to float32
+    if target is not None:
+        if isinstance(target, list):
+            for t in target:
+                if t in df.columns:
+                    df[t] = df[t].astype(np.float32)
+        elif target in df.columns:
+            df[target] = df[target].astype(np.float32)
+    
+    # Optimize all other numeric columns
+    for col in df.select_dtypes(include=['float64']).columns:
+        # Skip already processed columns
+        if features is not None and col in features:
+            continue
+        if target is not None:
+            if isinstance(target, list) and col in target:
+                continue
+            elif col == target:
+                continue
+        
+        # Convert float64 to float32
+        df[col] = df[col].astype(np.float32)
+    
+    # Convert integer columns to appropriate size
+    for col in df.select_dtypes(include=['int64']).columns:
+        # Check if int32 range is sufficient
+        if df[col].min() > np.iinfo(np.int32).min and df[col].max() < np.iinfo(np.int32).max:
+            df[col] = df[col].astype(np.int32)
+    
+    # Log memory savings
+    memory_usage_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
+    print(f"Optimized DataFrame memory usage: {memory_usage_mb:.2f} MB")
+    
+    return df
+
+def chunk_process_dataframe(df, chunk_size=10000, func=None):
+    """
+    Process a large DataFrame in chunks to avoid memory issues.
+    
+    Args:
+        df: DataFrame to process
+        chunk_size: Size of each chunk
+        func: Function to apply to each chunk, should take a DataFrame as input
+              and return a DataFrame
+    
+    Returns:
+        Processed DataFrame (combined result of processing all chunks)
+    """
+    if func is None:
+        return df
+    
+    result_chunks = []
+    
+    for i in range(0, len(df), chunk_size):
+        chunk = df.iloc[i:i+chunk_size].copy()
+        print(f"Processing chunk {i//chunk_size + 1}/{(len(df) + chunk_size - 1)//chunk_size}")
+        
+        # Apply function to chunk
+        processed_chunk = func(chunk)
+        result_chunks.append(processed_chunk)
+        
+        # Free memory
+        del chunk
+        gc.collect()
+    
+    # Combine results
+    result = pd.concat(result_chunks, axis=0, ignore_index=True)
+    return result
+
+def load_and_optimize(file_path, features=None, target=None, chunk_size=None):
+    """
+    Load a CSV or Parquet file and optimize its memory usage.
+    For large files, the loading and optimization is done in chunks.
+    
+    Args:
+        file_path: Path to the CSV or Parquet file
+        features: List of feature column names
+        target: Target column name or list of names
+        chunk_size: Size of chunks to use for loading large files
+                    If None, the file is loaded in one go
+    
+    Returns:
+        Optimized DataFrame
+    """
+    log_memory_usage("Before loading file")
+    
+    # Determine file type
+    file_extension = os.path.splitext(file_path)[1].lower()
+    
+    if chunk_size is not None:
+        # Load in chunks
+        if file_extension == '.csv':
+            chunks = pd.read_csv(file_path, chunksize=chunk_size)
+        elif file_extension in ['.parquet', '.pq']:
+            # Custom chunk loading for parquet
+            pq_file = pq.ParquetFile(file_path)
+            chunks = []
+            for i in range(0, pq_file.metadata.num_rows, chunk_size):
+                chunk = pd.read_parquet(
+                    file_path,
+                    skip_rows=i,
+                    num_rows=min(chunk_size, pq_file.metadata.num_rows - i)
+                )
+                chunks.append(chunk)
+        else:
+            raise ValueError(f"Unsupported file extension: {file_extension}")
+        
+        # Process chunks
+        optimized_chunks = []
+        for i, chunk in enumerate(chunks):
+            print(f"Optimizing chunk {i+1}")
+            optimized_chunk = optimize_dataframe(chunk, features, target)
+            optimized_chunks.append(optimized_chunk)
+            
+            # Free memory
+            del chunk
+            gc.collect()
+        
+        # Combine results
+        result = pd.concat(optimized_chunks, axis=0, ignore_index=True)
+        del optimized_chunks
+        gc.collect()
+        
+    else:
+        # Load in one go
+        if file_extension == '.csv':
+            df = pd.read_csv(file_path)
+        elif file_extension in ['.parquet', '.pq']:
+            df = pd.read_parquet(file_path)
+        else:
+            raise ValueError(f"Unsupported file extension: {file_extension}")
+        
+        # Optimize
+        result = optimize_dataframe(df, features, target)
+    
+    log_memory_usage("After loading and optimizing file")
+    return result
