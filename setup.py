@@ -42,7 +42,7 @@ setup(
         "plotly>=5.3.0",
         "PyYAML>=6.0",
         "psutil>=5.8.0",
-        "pyarrow>=6.0.0",
+        "pyarrow>=19.0.0",
         "feature-engine>=1.8.0"
     ],
     extras_require={
