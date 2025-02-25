@@ -586,7 +586,7 @@ def follow_up_domains_pipeline(
     correlation_threshold: float = 0.95
 ):
     """
-    Follow-up pipeline that ensures proper float32 data type conversion:
+    Follow-up pipeline with improved NaN handling and robust correlation calculation:
       1) Evaluates each domain's performance using correlation metrics
       2) Filters out low-performing domains
       3) Prunes highly correlated features within the kept domains
@@ -603,103 +603,149 @@ def follow_up_domains_pipeline(
     Returns:
         dict: Contains domain_scores, kept_domains, final_model_score, pruned_features, etc.
     """
-    print("Starting follow-up domains pipeline with float32 data type enforcement...")
+    print("Starting follow-up domains pipeline with improved NaN handling...")
+    
+    # Check if target column exists
+    if main_target not in train_df.columns:
+        print(f"Error: Target column '{main_target}' not found in training data")
+        print(f"Available columns: {train_df.columns[:10]}...")
+        return {
+            'error': f"Target column '{main_target}' not found in training data",
+            'domain_scores': {},
+            'kept_domains': [],
+            'pruned_features': []
+        }
     
     # -------------------------------------------------
-    # 0. Ensure data types are float32
+    # 0. Clean data and ensure proper types
     # -------------------------------------------------
-    print("Ensuring features are float32...")
+    print("Cleaning data and ensuring proper types...")
+    
+    # Check for NaN values in target
+    target_null_count = train_df[main_target].isnull().sum()
+    if target_null_count > 0:
+        print(f"Warning: Target column has {target_null_count} NaN values. Filling with mean.")
+        target_mean = train_df[main_target].mean()
+        train_df[main_target] = train_df[main_target].fillna(target_mean)
+    
+    # Get all features from all domains
     all_features = []
     for feats in feature_groups.values():
         all_features.extend(feats)
     all_features = list(set(all_features))  # Remove duplicates
     
-    # Verify the data types of features
-    float32_count = 0
-    for feature in all_features:
-        if feature in train_df.columns:
-            if train_df[feature].dtype == np.float32:
-                float32_count += 1
-            else:
-                print(f"Converting {feature} to float32 (was {train_df[feature].dtype})")
-                train_df[feature] = train_df[feature].astype(np.float32)
-            
-        if feature in val_df.columns:
-            if val_df[feature].dtype != np.float32:
-                val_df[feature] = val_df[feature].astype(np.float32)
+    # Check which features exist in the data
+    missing_features = [f for f in all_features if f not in train_df.columns]
+    if missing_features:
+        print(f"Warning: {len(missing_features)} features from domains not found in training data")
+        if len(missing_features) <= 10:
+            print(f"Missing features: {missing_features}")
+        else:
+            print(f"First 10 missing features: {missing_features[:10]}...")
     
-    print(f"{float32_count}/{len(all_features)} features were already float32")
+    valid_features = [f for f in all_features if f in train_df.columns]
+    print(f"Found {len(valid_features)}/{len(all_features)} valid features in training data")
+    
+    # Fill NaN values in features with 0
+    na_counts = train_df[valid_features].isna().sum()
+    features_with_na = na_counts[na_counts > 0]
+    if not features_with_na.empty:
+        print(f"Filling NaN values in {len(features_with_na)} features with 0")
+        for feature in features_with_na.index:
+            train_df[feature] = train_df[feature].fillna(0)
+    
+    # Check data types and convert to float32 if needed
+    float32_count = 0
+    for feature in valid_features:
+        if train_df[feature].dtype == np.float32:
+            float32_count += 1
+        else:
+            try:
+                train_df[feature] = train_df[feature].astype(np.float32)
+            except Exception as e:
+                print(f"Error converting {feature} to float32: {e}")
+                train_df[feature] = pd.to_numeric(train_df[feature], errors='coerce').fillna(0).astype(np.float32)
+    
+    print(f"{float32_count}/{len(valid_features)} features were already float32")
     
     # Convert target to float32
-    if main_target in train_df.columns and train_df[main_target].dtype != np.float32:
-        print(f"Converting target {main_target} to float32 (was {train_df[main_target].dtype})")
+    if train_df[main_target].dtype != np.float32:
         train_df[main_target] = train_df[main_target].astype(np.float32)
-    if main_target in val_df.columns and val_df[main_target].dtype != np.float32:
-        val_df[main_target] = val_df[main_target].astype(np.float32)
     
-    # Report memory usage
-    memory_usage_train = train_df.memory_usage(deep=True).sum() / (1024 * 1024)
-    memory_usage_val = val_df.memory_usage(deep=True).sum() / (1024 * 1024)
-    print(f"Memory usage - Train: {memory_usage_train:.2f} MB, Val: {memory_usage_val:.2f} MB")
+    # Also prepare validation data
+    if val_df is not None:
+        # Fill NaN values in target
+        if val_df[main_target].isnull().sum() > 0:
+            val_target_mean = val_df[main_target].mean()
+            val_df[main_target] = val_df[main_target].fillna(val_target_mean)
+        
+        # Fill NaN values in features with 0
+        val_valid_features = [f for f in valid_features if f in val_df.columns]
+        for feature in val_valid_features:
+            if val_df[feature].isnull().sum() > 0:
+                val_df[feature] = val_df[feature].fillna(0)
+            
+            # Convert to float32
+            if val_df[feature].dtype != np.float32:
+                try:
+                    val_df[feature] = val_df[feature].astype(np.float32)
+                except:
+                    val_df[feature] = pd.to_numeric(val_df[feature], errors='coerce').fillna(0).astype(np.float32)
+        
+        # Convert target to float32
+        if val_df[main_target].dtype != np.float32:
+            val_df[main_target] = val_df[main_target].astype(np.float32)
 
     # -------------------------------------------------
     # 1. Evaluate domain performance using correlation
     # -------------------------------------------------
-    print("Evaluating domain performance...")
+    print("Evaluating domain performance with robust correlation calculation...")
     domain_scores = {}
+    
+    # Define a robust correlation function
+    def robust_correlation(series1, series2):
+        # Remove any remaining NaN values
+        mask = ~np.isnan(series1) & ~np.isnan(series2)
+        if mask.sum() < 10:  # Need at least 10 valid pairs for meaningful correlation
+            return 0.0
+        
+        try:
+            # Calculate correlation using numpy directly
+            corr = np.corrcoef(series1[mask], series2[mask])[0, 1]
+            return abs(corr) if not np.isnan(corr) else 0.0
+        except Exception as e:
+            print(f"Error in correlation calculation: {e}")
+            return 0.0
+    
     for domain_name, feats in feature_groups.items():
-        # Handle empty or tiny feature groups
-        if len(feats) < 5:
-            print(f"  {domain_name}: Too few features ({len(feats)}), skipping")
+        # Find valid features that exist in the data
+        valid_domain_feats = [f for f in feats if f in train_df.columns]
+        
+        # Skip if too few features
+        if len(valid_domain_feats) < 5:
+            print(f"  {domain_name}: Too few valid features ({len(valid_domain_feats)}), skipping")
             domain_scores[domain_name] = 0.0
             continue
-            
+        
         # Calculate mean absolute correlation with target
-        try:
-            # Ensure features exist in train_df
-            valid_feats = [f for f in feats if f in train_df.columns]
-            if len(valid_feats) < 5:
-                print(f"  {domain_name}: Too few valid features ({len(valid_feats)}), skipping")
-                domain_scores[domain_name] = 0.0
-                continue
-                
-            # Calculate correlations efficiently based on dataset size
-            if len(train_df) > 50000:
-                correlations = []
-                # Process in chunks for large datasets
-                chunk_size = 10000
-                num_chunks = (len(train_df) + chunk_size - 1) // chunk_size
-                
-                for i in range(0, len(train_df), chunk_size):
-                    end_idx = min(i + chunk_size, len(train_df))
-                    chunk = train_df.iloc[i:end_idx]
-                    chunk_corrs = []
-                    
-                    for feat in valid_feats:
-                        feat_data = chunk[feat].fillna(0).values
-                        target_data = chunk[main_target].fillna(0).values
-                        corr = np.abs(np.corrcoef(feat_data, target_data)[0, 1])
-                        chunk_corrs.append(corr)
-                    
-                    # Average across features for this chunk
-                    correlations.append(np.mean(chunk_corrs))
-                
-                # Average across chunks
-                mean_corr = np.mean(correlations)
-            else:
-                # For smaller datasets, use pandas directly with proper float32 type
-                correlations = np.abs([
-                    np.corrcoef(
-                        train_df[feat].fillna(0).values,
-                        train_df[main_target].fillna(0).values
-                    )[0, 1] for feat in valid_feats
-                ])
-                mean_corr = np.mean(correlations)
-                
+        correlations = []
+        
+        for feat in valid_domain_feats:
+            try:
+                # Use our robust correlation function
+                corr = robust_correlation(train_df[feat], train_df[main_target])
+                if not np.isnan(corr):
+                    correlations.append(corr)
+            except Exception as e:
+                print(f"  Error calculating correlation for {feat}: {e}")
+        
+        # Calculate mean correlation
+        if correlations:
+            mean_corr = np.mean(correlations)
             domain_scores[domain_name] = float(mean_corr)
-            print(f"  {domain_name}: {mean_corr:.4f} (from {len(valid_feats)} features)")
-        except Exception as e:
-            print(f"  Error evaluating {domain_name}: {e}")
+            print(f"  {domain_name}: {mean_corr:.4f} (from {len(correlations)} valid features)")
+        else:
+            print(f"  {domain_name}: No valid correlations, setting score to 0")
             domain_scores[domain_name] = 0.0
     
     print("Domain performance scores (correlation with target):")
@@ -717,106 +763,68 @@ def follow_up_domains_pipeline(
     if not kept_domains:
         print("Warning: No domains met threshold. Keeping top 3 domains instead.")
         kept_domains = sorted(domain_scores.keys(), key=lambda d: domain_scores[d], reverse=True)[:3]
+        print(f"Top domains selected: {kept_domains}")
         
     # Gather all features from kept domains
     kept_features = []
     for d in kept_domains:
-        kept_features.extend(feature_groups[d])
+        domain_feats = feature_groups[d]
+        valid_feats = [f for f in domain_feats if f in train_df.columns]
+        kept_features.extend(valid_feats)
     kept_features = list(set(kept_features))  # Remove duplicates
     
     # Ensure features exist in both train and val datasets
-    valid_features = [f for f in kept_features if f in train_df.columns and f in val_df.columns]
-    print(f"Total features from kept domains: {len(valid_features)}/{len(kept_features)} valid features")
-    kept_features = valid_features
+    if val_df is not None:
+        valid_features = [f for f in kept_features if f in train_df.columns and f in val_df.columns]
+        print(f"Total features from kept domains: {len(valid_features)}/{len(kept_features)} valid features")
+        kept_features = valid_features
+    else:
+        valid_features = [f for f in kept_features if f in train_df.columns]
+        print(f"Total features from kept domains: {len(valid_features)}/{len(kept_features)} valid features (validation not checked)")
+        kept_features = valid_features
 
     # -------------------------------------------------
     # 3. Correlation pruning within kept features
     # -------------------------------------------------
     print(f"\nPruning correlated features (threshold={correlation_threshold})...")
     try:
-        # For very large datasets or feature sets, use a more memory-efficient approach
-        if len(train_df) > 50000 or len(kept_features) > 1000:
-            print("Using memory-efficient correlation pruning...")
-            
-            # Function to calculate correlation between features efficiently
-            def calc_feature_corr(feat1, feat2, df, chunk_size=10000):
-                """Calculate correlation between two features efficiently for large datasets"""
-                if len(df) <= chunk_size:
-                    # For smaller datasets, calculate directly
-                    return np.abs(np.corrcoef(
-                        df[feat1].fillna(0).values,
-                        df[feat2].fillna(0).values
-                    )[0, 1])
-                else:
-                    # For larger datasets, calculate in chunks
-                    corrs = []
-                    for i in range(0, len(df), chunk_size):
-                        end_idx = min(i + chunk_size, len(df))
-                        chunk = df.iloc[i:end_idx]
-                        corr = np.abs(np.corrcoef(
-                            chunk[feat1].fillna(0).values,
-                            chunk[feat2].fillna(0).values
-                        )[0, 1])
-                        corrs.append(corr)
-                    return np.mean(corrs)
-            
-            # Calculate correlation with target for all features
-            print("Calculating feature-target correlations...")
-            target_corrs = {}
-            for feat in kept_features:
-                target_corrs[feat] = calc_feature_corr(feat, main_target, train_df)
-            
-            # Sort features by correlation with target (descending)
-            sorted_features = sorted(target_corrs.keys(), key=lambda x: target_corrs[x], reverse=True)
-            
-            # Greedy feature selection
-            pruned_features = []
-            remaining = sorted_features.copy()
-            
-            print(f"Pruning {len(remaining)} features...")
-            with tqdm(total=len(remaining)) as pbar:
-                while remaining:
-                    # Add the feature with highest target correlation
-                    current = remaining.pop(0)
-                    pruned_features.append(current)
-                    pbar.update(1)
-                    
-                    # Find highly correlated features to remove
-                    to_remove = []
-                    for other in remaining:
-                        # Check if other feature is highly correlated with current
-                        corr = calc_feature_corr(current, other, train_df)
-                        if corr > correlation_threshold:
-                            to_remove.append(other)
-                            pbar.update(1)
-                    
-                    # Remove highly correlated features
-                    remaining = [f for f in remaining if f not in to_remove]
-            
-            print(f"Pruning complete. Kept {len(pruned_features)} features out of {len(kept_features)}")
-            
-        else:
-            # Use SmartCorrelatedSelection for smaller datasets
-            print("Using SmartCorrelatedSelection for correlation pruning...")
-            # Fit the selector on training data's kept features
-            selector = SmartCorrelatedSelection(
-                threshold=correlation_threshold, 
-                variables=kept_features,
-                method='pearson'
-            )
-            
-            # Only pass the required columns to avoid errors
-            columns_to_use = kept_features + [main_target]
-            train_subset = train_df[columns_to_use].copy()
-            
-            # Apply selection
-            selector.fit(train_subset)
-            
-            # Get features to drop and keep
-            features_to_drop = selector.features_to_drop_
-            pruned_features = [f for f in kept_features if f not in features_to_drop]
+        print("Using robust correlation pruning approach...")
         
-        print(f"Reduced from {len(kept_features)} to {len(pruned_features)} features after pruning")
+        # Calculate correlation with target for all features
+        print("Calculating feature-target correlations...")
+        target_corrs = {}
+        for feat in kept_features:
+            target_corrs[feat] = robust_correlation(train_df[feat], train_df[main_target])
+        
+        # Sort features by correlation with target (descending)
+        sorted_features = sorted(target_corrs.keys(), key=lambda x: target_corrs[x], reverse=True)
+        
+        # Greedy feature selection
+        pruned_features = []
+        remaining = sorted_features.copy()
+        
+        print(f"Pruning {len(remaining)} features...")
+        while remaining:
+            # Add the feature with highest target correlation
+            if not remaining:
+                break
+                
+            current = remaining.pop(0)
+            pruned_features.append(current)
+            
+            # Find highly correlated features to remove
+            to_remove = []
+            for other in remaining:
+                # Check if other feature is highly correlated with current
+                corr = robust_correlation(train_df[current], train_df[other])
+                if corr > correlation_threshold:
+                    to_remove.append(other)
+            
+            # Remove highly correlated features
+            remaining = [f for f in remaining if f not in to_remove]
+        
+        print(f"Pruning complete. Kept {len(pruned_features)} features out of {len(kept_features)}")
+            
     except Exception as e:
         print(f"Error in correlation pruning: {e}")
         traceback.print_exc()
@@ -828,11 +836,16 @@ def follow_up_domains_pipeline(
     # -------------------------------------------------
     print("\nTraining final global regression model with pruned features...")
     try:
-        # Check if pruned features exist in both datasets
-        valid_features = [f for f in pruned_features if f in train_df.columns and f in val_df.columns]
-        if len(valid_features) < len(pruned_features):
-            print(f"Warning: {len(pruned_features) - len(valid_features)} features not found in both datasets")
-            pruned_features = valid_features
+        # Check if we have enough pruned features
+        if len(pruned_features) < 5:
+            print(f"Warning: Too few pruned features ({len(pruned_features)}), adding more features")
+            # Add more features to ensure we have at least 5
+            additional_features = [f for f in kept_features if f not in pruned_features]
+            additional_features = sorted(additional_features, 
+                                        key=lambda f: target_corrs.get(f, 0),
+                                        reverse=True)
+            pruned_features.extend(additional_features[:max(5 - len(pruned_features), 0)])
+            print(f"Added features to reach {len(pruned_features)} total features")
             
         if len(pruned_features) == 0:
             raise ValueError("No valid features remaining after pruning")
@@ -850,52 +863,63 @@ def follow_up_domains_pipeline(
             random_state=42
         )
         
-        # Prepare training data ensuring float32 type
+        # Prepare training data ensuring float32 type and no NaNs
         X_train = train_df[pruned_features].fillna(0).astype(np.float32)
         y_train = train_df[main_target].fillna(0).astype(np.float32)
         
+        print(f"Training final model on {len(X_train)} samples with {len(pruned_features)} features...")
+        
+        # Check for any remaining issues
+        if X_train.isna().any().any():
+            print("Warning: X_train still has NaN values after fillna. Fixing...")
+            X_train = X_train.fillna(0)
+            
+        if y_train.isna().any():
+            print("Warning: y_train still has NaN values after fillna. Fixing...")
+            y_train = y_train.fillna(y_train.mean())
+        
         # Train model
-        print(f"Training LGBMRegressor on {len(X_train)} samples with {len(pruned_features)} features...")
-        if len(X_train) > 100000:
-            # Use validation set for early stopping with large datasets
-            eval_set = [(
-                val_df[pruned_features].fillna(0).astype(np.float32),
-                val_df[main_target].fillna(0).astype(np.float32)
-            )]
-            final_model.fit(
-                X_train, 
-                y_train,
-                eval_set=eval_set,
-                eval_metric='rmse',
-                early_stopping_rounds=50,
-                verbose=100
-            )
-        else:
-            # Standard training for smaller datasets
-            final_model.fit(
-                X_train, 
-                y_train,
-                eval_metric='rmse'
-            )
+        final_model.fit(
+            X_train, 
+            y_train,
+            eval_metric='rmse'
+        )
         
         # Generate predictions and calculate correlation
-        X_val = val_df[pruned_features].fillna(0).astype(np.float32)
-        y_val = val_df[main_target].fillna(0).astype(np.float32)
-        
-        val_preds = final_model.predict(X_val)
-        final_score = np.corrcoef(y_val.values, val_preds)[0, 1]
-        print(f"Final model correlation score: {final_score:.4f}")
+        if val_df is not None:
+            # Prepare validation data
+            X_val = val_df[pruned_features].fillna(0).astype(np.float32)
+            y_val = val_df[main_target].fillna(0).astype(np.float32)
+            
+            # Make predictions
+            val_preds = final_model.predict(X_val)
+            
+            # Calculate correlation
+            final_score = robust_correlation(y_val.values, val_preds)
+            print(f"Final model correlation score: {final_score:.4f}")
+            
+            # Calculate Spearman correlation
+            from scipy.stats import spearmanr
+            spearman_corr = spearmanr(y_val.values, val_preds)[0]
+            print(f"Spearman correlation: {spearman_corr:.4f}")
+        else:
+            # No validation data, use training data for evaluation
+            print("No validation data provided, evaluating on training data")
+            train_preds = final_model.predict(X_train)
+            final_score = robust_correlation(y_train.values, train_preds)
+            
+            # Calculate Spearman correlation
+            from scipy.stats import spearmanr
+            spearman_corr = spearmanr(y_train.values, train_preds)[0]
+            
+            print(f"Final model correlation score (on training): {final_score:.4f}")
+            print(f"Spearman correlation (on training): {spearman_corr:.4f}")
         
         # Calculate feature importance
         feature_importance = pd.DataFrame({
             'feature': pruned_features,
             'importance': final_model.feature_importances_
         }).sort_values('importance', ascending=False)
-        
-        # Also calculate Spearman correlation for Numerai context
-        from scipy.stats import spearmanr
-        spearman_corr = spearmanr(y_val.values, val_preds)[0]
-        print(f"Spearman correlation: {spearman_corr:.4f}")
         
     except Exception as e:
         print(f"Error in final model training: {e}")
