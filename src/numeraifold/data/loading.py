@@ -8,6 +8,7 @@ settings, process data in batches for model inference, and create properly forma
 
 import os
 import json
+import traceback
 import pandas as pd
 import numpy as np
 import torch
@@ -21,10 +22,11 @@ from numeraifold.utils.logging import log_memory_usage
 def load_data(data_version="v5.0", feature_set="small",
               main_target="target", aux_targets=None, num_aux_targets=5):
     """
-    Load data with memory-efficient settings and robust target handling.
+    Load data with memory-efficient settings, robust target handling,
+    and explicit float32 conversion.
     """
     print(f"Loading {data_version} data with {feature_set} feature set...")
-    
+   
     # Download data if needed
     napi = NumerAPI()
     for file in ['train.parquet', 'validation.parquet', 'features.json']:
@@ -32,25 +34,25 @@ def load_data(data_version="v5.0", feature_set="small",
         if not os.path.exists(filepath):
             print(f"Downloading {file}...")
             napi.download_dataset(filepath)
-
+            
     # Load feature metadata
     with open(f"{data_version}/features.json") as f:
         feature_metadata = json.load(f)
     features = feature_metadata["feature_sets"][feature_set]
-
+    
     # Get available targets from schema without printing
     schema = pq.read_schema(f"{data_version}/train.parquet")
     available_targets = [col for col in schema.names if col.startswith('target')]
-    
+   
     # Validate all targets before loading
     if main_target not in available_targets:
         print(f"Warning: {main_target} not found in dataset. Using first available target.")
         main_target = available_targets[0] if available_targets else None
-        
+       
     if not main_target:
         print("No valid main target found. Please check the dataset.")
         return None, None, features, []
-
+        
     # Validate aux_targets if provided
     final_targets = [main_target]
     if aux_targets is not None:
@@ -69,32 +71,111 @@ def load_data(data_version="v5.0", feature_set="small",
                 print(f"Warning: Only {num_to_add} additional targets available")
             selected = np.random.choice(remaining_targets, size=num_to_add, replace=False)
             final_targets.extend(selected)
-
     print(f"Using targets: {final_targets}")
-    
+   
     # Load data with memory efficiency
     try:
         columns_to_load = ["era"] + features + final_targets
         print(f"Reading train data with {len(features)} features and {len(final_targets)} targets...")
         
-        train_df = pd.read_parquet(
-            f"{data_version}/train.parquet",
-            columns=columns_to_load,
-            dtype_backend='pyarrow'
-        )
+        # Determine if we need to use chunked loading based on feature set size
+        use_chunked_loading = feature_set in ["medium", "large"] or len(features) > 500
         
-        print("Reading validation data...")
-        val_df = pd.read_parquet(
-            f"{data_version}/validation.parquet",
-            columns=columns_to_load,
-            dtype_backend='pyarrow'
-        )
-        
+        if use_chunked_loading:
+            print("Using chunked loading for large dataset...")
+            # Define chunk size based on feature set
+            if feature_set == "large":
+                chunk_size = 10000
+            else:  # medium
+                chunk_size = 20000
+                
+            # Load training data in chunks
+            train_chunks = []
+            train_file = f"{data_version}/train.parquet"
+            train_pq = pq.ParquetFile(train_file)
+            
+            for i in range(0, train_pq.metadata.num_rows, chunk_size):
+                print(f"Loading train chunk {i//chunk_size + 1}/{(train_pq.metadata.num_rows + chunk_size - 1)//chunk_size}")
+                chunk = pd.read_parquet(
+                    train_file,
+                    columns=columns_to_load,
+                    skip_rows=i,
+                    num_rows=min(chunk_size, train_pq.metadata.num_rows - i)
+                )
+                
+                # Convert features and targets to float32
+                for col in features + final_targets:
+                    if col in chunk.columns:
+                        chunk[col] = chunk[col].astype(np.float32)
+                
+                train_chunks.append(chunk)
+                
+            # Combine chunks
+            train_df = pd.concat(train_chunks, ignore_index=True)
+            del train_chunks
+            gc.collect()
+            
+            # Load validation data in chunks
+            val_chunks = []
+            val_file = f"{data_version}/validation.parquet"
+            val_pq = pq.ParquetFile(val_file)
+            
+            for i in range(0, val_pq.metadata.num_rows, chunk_size):
+                print(f"Loading validation chunk {i//chunk_size + 1}/{(val_pq.metadata.num_rows + chunk_size - 1)//chunk_size}")
+                chunk = pd.read_parquet(
+                    val_file,
+                    columns=columns_to_load,
+                    skip_rows=i,
+                    num_rows=min(chunk_size, val_pq.metadata.num_rows - i)
+                )
+                
+                # Convert features and targets to float32
+                for col in features + final_targets:
+                    if col in chunk.columns:
+                        chunk[col] = chunk[col].astype(np.float32)
+                
+                val_chunks.append(chunk)
+                
+            # Combine chunks
+            val_df = pd.concat(val_chunks, ignore_index=True)
+            del val_chunks
+            gc.collect()
+            
+        else:
+            # Load entire datasets at once for smaller feature sets
+            train_df = pd.read_parquet(
+                f"{data_version}/train.parquet",
+                columns=columns_to_load,
+                dtype_backend='pyarrow'
+            )
+            
+            print("Reading validation data...")
+            val_df = pd.read_parquet(
+                f"{data_version}/validation.parquet",
+                columns=columns_to_load,
+                dtype_backend='pyarrow'
+            )
+            
+            # Convert features and targets to float32
+            print("Converting features and targets to float32...")
+            for col in features + final_targets:
+                if col in train_df.columns:
+                    train_df[col] = train_df[col].astype(np.float32)
+                if col in val_df.columns:
+                    val_df[col] = val_df[col].astype(np.float32)
+       
         print(f"Train shape: {train_df.shape}, Validation shape: {val_df.shape}")
-        return train_df, val_df, features, final_targets
         
+        # Report memory usage
+        train_memory = train_df.memory_usage(deep=True).sum() / (1024 * 1024)
+        val_memory = val_df.memory_usage(deep=True).sum() / (1024 * 1024)
+        print(f"Memory usage - Train: {train_memory:.2f} MB, Val: {val_memory:.2f} MB")
+        
+        return train_df, val_df, features, final_targets
+       
     except Exception as e:
         print(f"Error loading data: {str(e)}")
+        traceback.print_exc()
         return None, None, features, []
 
 def process_in_batches(df, model, features, device='cuda' if torch.cuda.is_available() else 'cpu'):
