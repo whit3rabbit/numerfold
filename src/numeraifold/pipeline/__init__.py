@@ -11,7 +11,8 @@ from .execution import (
     run_alphafold_pipeline,
     run_domains_only_pipeline,
     extract_feature_domains_only,
-    follow_up_domains_pipeline
+    follow_up_domains_pipeline,
+    chunked_data_loader
 )
 
 __all__ = [
@@ -22,10 +23,11 @@ __all__ = [
     'get_default_pipeline_config',
     'save_pipeline_config',
     'load_pipeline_config',
-    
+
     # Execution
     'run_alphafold_pipeline',
     'run_domains_only_pipeline',
     'extract_feature_domains_only',
-    'follow_up_domains_pipeline'
+    'follow_up_domains_pipeline',
+    'chunked_data_loader'
 ]
