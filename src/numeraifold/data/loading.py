@@ -37,6 +37,7 @@ def load_data(data_version="v5.0", feature_set="small",
             
     # Load feature metadata
     with open(f"{data_version}/features.json") as f:
+        import json
         feature_metadata = json.load(f)
     features = feature_metadata["feature_sets"][feature_set]
     
@@ -79,36 +80,37 @@ def load_data(data_version="v5.0", feature_set="small",
         print(f"Reading train data with {len(features)} features and {len(final_targets)} targets...")
         
         # Determine if we need to use chunked loading based on feature set size
-        use_chunked_loading = feature_set in ["medium", "large"] or len(features) > 500
+        use_chunked_loading = feature_set in ["medium", "large", "all"] or len(features) > 500
         
         if use_chunked_loading:
             print("Using chunked loading for large dataset...")
             # Define chunk size based on feature set
-            if feature_set == "large":
+            if feature_set == "large" or feature_set == "all":
                 chunk_size = 10000
             else:  # medium
                 chunk_size = 20000
                 
-            # Load training data in chunks
+            # Load training data in chunks using the pyarrow.parquet API directly
+            # This avoids the pandas API which has inconsistent parameter naming
             train_chunks = []
             train_file = f"{data_version}/train.parquet"
             train_pq = pq.ParquetFile(train_file)
             
             for i in range(0, train_pq.metadata.num_rows, chunk_size):
                 print(f"Loading train chunk {i//chunk_size + 1}/{(train_pq.metadata.num_rows + chunk_size - 1)//chunk_size}")
-                chunk = pd.read_parquet(
-                    train_file,
-                    columns=columns_to_load,
-                    skip_rows=i,
-                    num_rows=min(chunk_size, train_pq.metadata.num_rows - i)
-                )
+                # Use the correct API for pyarrow.parquet
+                batch_size = min(chunk_size, train_pq.metadata.num_rows - i)
+                chunk = train_pq.read_row_group_file(train_file, i // train_pq.metadata.row_group_size,
+                                                    columns=columns_to_load)
+                # Convert to pandas
+                chunk_df = chunk.to_pandas()
                 
                 # Convert features and targets to float32
                 for col in features + final_targets:
-                    if col in chunk.columns:
-                        chunk[col] = chunk[col].astype(np.float32)
+                    if col in chunk_df.columns:
+                        chunk_df[col] = chunk_df[col].astype(np.float32)
                 
-                train_chunks.append(chunk)
+                train_chunks.append(chunk_df)
                 
             # Combine chunks
             train_df = pd.concat(train_chunks, ignore_index=True)
@@ -122,19 +124,17 @@ def load_data(data_version="v5.0", feature_set="small",
             
             for i in range(0, val_pq.metadata.num_rows, chunk_size):
                 print(f"Loading validation chunk {i//chunk_size + 1}/{(val_pq.metadata.num_rows + chunk_size - 1)//chunk_size}")
-                chunk = pd.read_parquet(
-                    val_file,
-                    columns=columns_to_load,
-                    skip_rows=i,
-                    num_rows=min(chunk_size, val_pq.metadata.num_rows - i)
-                )
+                batch_size = min(chunk_size, val_pq.metadata.num_rows - i)
+                chunk = val_pq.read_row_group_file(val_file, i // val_pq.metadata.row_group_size,
+                                                 columns=columns_to_load)
+                chunk_df = chunk.to_pandas()
                 
                 # Convert features and targets to float32
                 for col in features + final_targets:
-                    if col in chunk.columns:
-                        chunk[col] = chunk[col].astype(np.float32)
+                    if col in chunk_df.columns:
+                        chunk_df[col] = chunk_df[col].astype(np.float32)
                 
-                val_chunks.append(chunk)
+                val_chunks.append(chunk_df)
                 
             # Combine chunks
             val_df = pd.concat(val_chunks, ignore_index=True)
