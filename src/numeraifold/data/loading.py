@@ -13,8 +13,10 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import pyarrow.parquet as pq
+import gc
 from numerapi import NumerAPI
 
+from numeraifold.utils.logging import log_memory_usage
 
 def load_data(data_version="v5.0", feature_set="small",
               main_target="target", aux_targets=None, num_aux_targets=5):
@@ -254,3 +256,164 @@ def create_model_inputs(df, features, era_col='era', dtype=np.float32):
     feature_data = feature_data.reshape(feature_data.shape[0], feature_data.shape[1], 1)
 
     return feature_data
+
+
+def optimize_dataframe(df, features=None, target=None, inplace=False):
+    """
+    Optimize a pandas DataFrame's memory usage by converting to appropriate dtypes.
+    
+    Args:
+        df: DataFrame to optimize
+        features: List of feature column names to convert to float32
+        target: Target column name to convert to float32
+        inplace: Whether to modify the DataFrame in place
+        
+    Returns:
+        Optimized DataFrame
+    """
+    if not inplace:
+        df = df.copy()
+    
+    # Convert specific features to float32
+    if features is not None:
+        for col in features:
+            if col in df.columns:
+                df[col] = df[col].astype(np.float32)
+    
+    # Convert target to float32
+    if target is not None:
+        if isinstance(target, list):
+            for t in target:
+                if t in df.columns:
+                    df[t] = df[t].astype(np.float32)
+        elif target in df.columns:
+            df[target] = df[target].astype(np.float32)
+    
+    # Optimize all other numeric columns
+    for col in df.select_dtypes(include=['float64']).columns:
+        # Skip already processed columns
+        if features is not None and col in features:
+            continue
+        if target is not None:
+            if isinstance(target, list) and col in target:
+                continue
+            elif col == target:
+                continue
+        
+        # Convert float64 to float32
+        df[col] = df[col].astype(np.float32)
+    
+    # Convert integer columns to appropriate size
+    for col in df.select_dtypes(include=['int64']).columns:
+        # Check if int32 range is sufficient
+        if df[col].min() > np.iinfo(np.int32).min and df[col].max() < np.iinfo(np.int32).max:
+            df[col] = df[col].astype(np.int32)
+    
+    # Log memory savings
+    memory_usage_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
+    print(f"Optimized DataFrame memory usage: {memory_usage_mb:.2f} MB")
+    
+    return df
+
+def chunk_process_dataframe(df, chunk_size=10000, func=None):
+    """
+    Process a large DataFrame in chunks to avoid memory issues.
+    
+    Args:
+        df: DataFrame to process
+        chunk_size: Size of each chunk
+        func: Function to apply to each chunk, should take a DataFrame as input
+              and return a DataFrame
+    
+    Returns:
+        Processed DataFrame (combined result of processing all chunks)
+    """
+    if func is None:
+        return df
+    
+    result_chunks = []
+    
+    for i in range(0, len(df), chunk_size):
+        chunk = df.iloc[i:i+chunk_size].copy()
+        print(f"Processing chunk {i//chunk_size + 1}/{(len(df) + chunk_size - 1)//chunk_size}")
+        
+        # Apply function to chunk
+        processed_chunk = func(chunk)
+        result_chunks.append(processed_chunk)
+        
+        # Free memory
+        del chunk
+        gc.collect()
+    
+    # Combine results
+    result = pd.concat(result_chunks, axis=0, ignore_index=True)
+    return result
+
+def load_and_optimize(file_path, features=None, target=None, chunk_size=None):
+    """
+    Load a CSV or Parquet file and optimize its memory usage.
+    For large files, the loading and optimization is done in chunks.
+    
+    Args:
+        file_path: Path to the CSV or Parquet file
+        features: List of feature column names
+        target: Target column name or list of names
+        chunk_size: Size of chunks to use for loading large files
+                    If None, the file is loaded in one go
+    
+    Returns:
+        Optimized DataFrame
+    """
+    log_memory_usage("Before loading file")
+    
+    # Determine file type
+    file_extension = os.path.splitext(file_path)[1].lower()
+    
+    if chunk_size is not None:
+        # Load in chunks
+        if file_extension == '.csv':
+            chunks = pd.read_csv(file_path, chunksize=chunk_size)
+        elif file_extension in ['.parquet', '.pq']:
+            # Custom chunk loading for parquet
+            pq_file = pq.ParquetFile(file_path)
+            chunks = []
+            for i in range(0, pq_file.metadata.num_rows, chunk_size):
+                chunk = pd.read_parquet(
+                    file_path,
+                    skip_rows=i,
+                    num_rows=min(chunk_size, pq_file.metadata.num_rows - i)
+                )
+                chunks.append(chunk)
+        else:
+            raise ValueError(f"Unsupported file extension: {file_extension}")
+        
+        # Process chunks
+        optimized_chunks = []
+        for i, chunk in enumerate(chunks):
+            print(f"Optimizing chunk {i+1}")
+            optimized_chunk = optimize_dataframe(chunk, features, target)
+            optimized_chunks.append(optimized_chunk)
+            
+            # Free memory
+            del chunk
+            gc.collect()
+        
+        # Combine results
+        result = pd.concat(optimized_chunks, axis=0, ignore_index=True)
+        del optimized_chunks
+        gc.collect()
+        
+    else:
+        # Load in one go
+        if file_extension == '.csv':
+            df = pd.read_csv(file_path)
+        elif file_extension in ['.parquet', '.pq']:
+            df = pd.read_parquet(file_path)
+        else:
+            raise ValueError(f"Unsupported file extension: {file_extension}")
+        
+        # Optimize
+        result = optimize_dataframe(df, features, target)
+    
+    log_memory_usage("After loading and optimizing file")
+    return result

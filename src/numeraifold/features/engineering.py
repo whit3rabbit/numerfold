@@ -1,4 +1,5 @@
 # Standard library and third-party imports
+import traceback
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
@@ -196,142 +197,117 @@ class AlphaFoldFeatureEngineering(BaseEstimator, TransformerMixin):
         return result_df
 
 
-def generate_alphafold_features(train_df, val_df, model, features, confidence_threshold=0.5, device='cuda'):
+def generate_alphafold_features(train_df, val_df, model, features, confidence_threshold=0.5):
     """
-    Generate AlphaFold-inspired features from training and validation data.
-
-    This function processes the data in batches, generates embeddings, predictions,
-    and confidence scores, and then constructs new DataFrames with these features.
-
-    Parameters:
-        train_df (pd.DataFrame): Training data.
-        val_df (pd.DataFrame): Validation data.
-        model: Model used for feature extraction.
-        features (list): List of feature column names to use.
-        confidence_threshold (float): Threshold to mark high confidence predictions.
-        device (str): Device to use for model inference (e.g., 'cuda' or 'cpu').
-
+    Generate AlphaFold-inspired features with explicit float32 conversion.
+    
+    Args:
+        train_df: Training dataframe
+        val_df: Validation dataframe
+        model: Trained NumerAIFold model
+        features: List of feature column names
+        confidence_threshold: Threshold for high-confidence predictions
+        
     Returns:
-        tuple: (train_df_new, val_df_new) DataFrames with engineered features,
-               or (None, None) if an error occurs.
+        train_features_df, val_features_df: DataFrames with generated features
     """
     print("Generating AlphaFold-inspired features...")
-
-    def process_predictions(preds):
-        """
-        Ensure predictions are one-dimensional.
-
-        Parameters:
-            preds (np.array): Array of predictions.
-
-        Returns:
-            np.array: Flattened prediction array.
-        """
-        if preds.ndim == 2:
-            if preds.shape[1] == 1:
-                return preds.squeeze()
-            else:
-                print(f"Multiple prediction columns found, using first column. Shape: {preds.shape}")
-                return preds[:, 0]
-        return preds
-
-    # Process training data in batches
-    print("Processing training data...")
-    train_embeddings, train_confidences, train_preds = process_in_batches(
-        train_df, model, features, device
-    )
-
-    if train_embeddings is None:
-        print("Failed to generate training features")
-        return None, None
-
-    print(f"Training data shapes - embeddings: {train_embeddings.shape}, "
-          f"confidences: {train_confidences.shape}, predictions: {train_preds.shape}")
-
-    # Process validation data in batches
-    print("Processing validation data...")
-    val_embeddings, val_confidences, val_preds = process_in_batches(
-        val_df, model, features, device
-    )
-
-    if val_embeddings is None:
-        print("Failed to generate validation features")
-        return None, None
-
-    print(f"Validation data shapes - embeddings: {val_embeddings.shape}, "
-          f"confidences: {val_confidences.shape}, predictions: {val_preds.shape}")
-
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+    
+    # Process dataframes in chunks if they're large
+    def process_df_in_chunks(df, chunk_size=5000):
+        """Process large dataframes in chunks to avoid memory issues"""
+        all_embeddings = []
+        all_predictions = []
+        all_confidences = []
+        
+        for i in range(0, len(df), chunk_size):
+            chunk = df.iloc[i:i+chunk_size]
+            print(f"Processing chunk {i//chunk_size + 1}/{(len(df) + chunk_size - 1)//chunk_size}")
+            
+            # Convert features to float32
+            X = np.array(chunk[features].fillna(0).values, dtype=np.float32)
+            X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+            
+            with torch.no_grad():
+                # Get model outputs
+                outputs = model(X_tensor)
+                predictions = outputs['predictions'].cpu().numpy()
+                confidences = outputs['confidence'].cpu().numpy()
+                embeddings = outputs['embeddings'].cpu().numpy()
+            
+            all_embeddings.append(embeddings)
+            all_predictions.append(predictions)
+            all_confidences.append(confidences)
+        
+        # Combine results
+        return np.vstack(all_embeddings), np.vstack(all_predictions), np.vstack(all_confidences)
+    
     try:
-        # Ensure predictions are 1D arrays
-        train_preds_flat = process_predictions(train_preds)
-        val_preds_flat = process_predictions(val_preds)
-
-        print(f"Processed prediction shapes - train: {train_preds_flat.shape}, "
-              f"val: {val_preds_flat.shape}")
-
-        # Verify that the dimensions of data, predictions, and confidences match
-        if not (len(train_df.index) == len(train_preds_flat) == len(train_confidences)):
-            raise ValueError(f"Mismatched dimensions in training data: "
-                             f"index={len(train_df.index)}, predictions={len(train_preds_flat)}, "
-                             f"confidences={len(train_confidences)}")
-
-        if not (len(val_df.index) == len(val_preds_flat) == len(val_confidences)):
-            raise ValueError(f"Mismatched dimensions in validation data: "
-                             f"index={len(val_df.index)}, predictions={len(val_preds_flat)}, "
-                             f"confidences={len(val_confidences)}")
-
-        # Create column names for the embeddings
-        train_embedding_columns = [f'af_emb_{i}' for i in range(train_embeddings.shape[1])]
-        val_embedding_columns = [f'af_emb_{i}' for i in range(val_embeddings.shape[1])]
-
-        # Construct new DataFrame for training data with embeddings and additional features
-        train_df_new = pd.DataFrame(
-            train_embeddings,
-            index=train_df.index,
-            columns=train_embedding_columns
-        )
-        train_df_new['af_prediction'] = train_preds_flat  # Original prediction from model
-        train_df_new['prediction'] = train_preds_flat       # Required column for evaluation
-        train_df_new['af_confidence'] = train_confidences
-        train_df_new['af_high_confidence'] = (train_confidences > confidence_threshold).astype(int)
-
-        # Construct new DataFrame for validation data with embeddings and additional features
-        val_df_new = pd.DataFrame(
-            val_embeddings,
-            index=val_df.index,
-            columns=val_embedding_columns
-        )
-        val_df_new['af_prediction'] = val_preds_flat       # Original prediction from model
-        val_df_new['prediction'] = val_preds_flat            # Required column for evaluation
-        val_df_new['af_confidence'] = val_confidences
-        val_df_new['af_high_confidence'] = (val_confidences > confidence_threshold).astype(int)
-
-        # Final shape verification
-        print(f"Final DataFrame shapes - train: {train_df_new.shape}, val: {val_df_new.shape}")
-
-        # Check that all required columns are present
-        required_cols = ['prediction', 'af_prediction', 'af_confidence', 'af_high_confidence']
-        missing_train = [col for col in required_cols if col not in train_df_new.columns]
-        missing_val = [col for col in required_cols if col not in val_df_new.columns]
-
-        if missing_train or missing_val:
-            raise ValueError(f"Missing required columns - train: {missing_train}, val: {missing_val}")
-
-        # Create a new column for confidence-weighted predictions
-        train_df_new['confidence_weighted_prediction'] = train_df_new['prediction'] * train_df_new['af_confidence']
-        val_df_new['confidence_weighted_prediction'] = val_df_new['prediction'] * val_df_new['af_confidence']
-
-        return train_df_new, val_df_new
-
+        # Process training data
+        if len(train_df) > 10000:
+            print("Processing training data in chunks...")
+            train_embeddings, train_preds, train_confidences = process_df_in_chunks(train_df)
+        else:
+            # Convert features to float32
+            X_train = np.array(train_df[features].fillna(0).values, dtype=np.float32)
+            X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
+            
+            with torch.no_grad():
+                outputs_train = model(X_train_tensor)
+                train_preds = outputs_train['predictions'].cpu().numpy()
+                train_confidences = outputs_train['confidence'].cpu().numpy()
+                train_embeddings = outputs_train['embeddings'].cpu().numpy()
+        
+        # Process validation data
+        if len(val_df) > 10000:
+            print("Processing validation data in chunks...")
+            val_embeddings, val_preds, val_confidences = process_df_in_chunks(val_df)
+        else:
+            # Convert features to float32
+            X_val = np.array(val_df[features].fillna(0).values, dtype=np.float32)
+            X_val_tensor = torch.tensor(X_val, dtype=torch.float32).to(device)
+            
+            with torch.no_grad():
+                outputs_val = model(X_val_tensor)
+                val_preds = outputs_val['predictions'].cpu().numpy()
+                val_confidences = outputs_val['confidence'].cpu().numpy()
+                val_embeddings = outputs_val['embeddings'].cpu().numpy()
+        
+        # Create feature dataframes
+        print("Creating feature dataframes...")
+        # Create embedding feature columns
+        train_features_dict = {}
+        val_features_dict = {}
+        
+        # Add embedding features
+        embed_dim = train_embeddings.shape[1]
+        for i in range(embed_dim):
+            col_name = f'af_emb_{i}'
+            train_features_dict[col_name] = train_embeddings[:, i].astype(np.float32)
+            val_features_dict[col_name] = val_embeddings[:, i].astype(np.float32)
+        
+        # Add prediction and confidence
+        train_features_dict['prediction'] = train_preds.flatten().astype(np.float32)
+        train_features_dict['af_confidence'] = train_confidences.flatten().astype(np.float32)
+        train_features_dict['af_high_confidence'] = (train_confidences.flatten() > confidence_threshold).astype(np.float32)
+        
+        val_features_dict['prediction'] = val_preds.flatten().astype(np.float32)
+        val_features_dict['af_confidence'] = val_confidences.flatten().astype(np.float32)
+        val_features_dict['af_high_confidence'] = (val_confidences.flatten() > confidence_threshold).astype(np.float32)
+        
+        # Create dataframes
+        train_features_df = pd.DataFrame(train_features_dict)
+        val_features_df = pd.DataFrame(val_features_dict)
+        
+        print(f"Generated features - Train: {train_features_df.shape}, Val: {val_features_df.shape}")
+        return train_features_df, val_features_df
+    
     except Exception as e:
-        print(f"Error creating feature DataFrames: {str(e)}")
-        print("Debug information:")
-        print(f"Train embeddings type: {type(train_embeddings)}, "
-              f"shape: {train_embeddings.shape if hasattr(train_embeddings, 'shape') else 'unknown'}")
-        print(f"Train confidences type: {type(train_confidences)}, "
-              f"shape: {train_confidences.shape if hasattr(train_confidences, 'shape') else 'unknown'}")
-        print(f"Train predictions type: {type(train_preds)}, "
-              f"shape: {train_preds.shape if hasattr(train_preds, 'shape') else 'unknown'}")
+        print(f"Error generating features: {e}")
+        print(traceback.format_exc())
         return None, None
 
 

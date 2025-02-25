@@ -491,6 +491,7 @@ def run_alphafold_pipeline(train_df, val_df, features, targets,
     print("AlphaFold-inspired pipeline completed")
     return results
 
+# Improved chunked_data_loader function with proper float32 conversion
 def chunked_data_loader(
     data_version: str,
     feature_set: str,
@@ -498,7 +499,7 @@ def chunked_data_loader(
     target_params: Optional[Dict] = None
 ):
     """
-    Generator to load data in chunks.
+    Generator to load data in chunks with proper float32 conversion.
     
     Args:
         data_version: Version of dataset
@@ -527,12 +528,12 @@ def chunked_data_loader(
     features = feature_metadata["feature_sets"][feature_set]
     
     # Get targets
+    main_target = target_params.get('main_target', 'target')
     available_targets = [col for col in all_columns if col.startswith('target')]
     if main_target not in available_targets:
         print(f"Warning: {main_target} not found in dataset. Using first available target.")
         main_target = available_targets[0] if available_targets else None
     
-    main_target = target_params.get('main_target', main_target)
     num_aux_targets = target_params.get('num_aux_targets', 3)
     aux_targets = [t for t in available_targets if t != main_target][:num_aux_targets]
     all_targets = [main_target] + aux_targets if main_target else aux_targets
@@ -543,15 +544,35 @@ def chunked_data_loader(
     # Create ParquetFile object
     parquet_file = pq.ParquetFile(file_path)
     
-    # Read in chunks
+    # Read in chunks and convert to float32
     for i in range(0, parquet_file.metadata.num_rows, chunk_size):
-        chunk = pd.read_parquet(
-            file_path,
-            columns=["era"] + features + all_targets,
-            skip_rows=i,
-            num_rows=min(chunk_size, parquet_file.metadata.num_rows - i)
-        )
-        yield chunk, features, all_targets
+        try:
+            # Read chunk with appropriate columns
+            chunk = pd.read_parquet(
+                file_path,
+                columns=["era"] + features + all_targets,
+                skip_rows=i,
+                num_rows=min(chunk_size, parquet_file.metadata.num_rows - i)
+            )
+            
+            # Convert features and targets to float32
+            for feature in features:
+                chunk[feature] = chunk[feature].astype(np.float32)
+            
+            for target in all_targets:
+                if target in chunk.columns:
+                    chunk[target] = chunk[target].astype(np.float32)
+            
+            # Report memory usage for monitoring
+            memory_usage = chunk.memory_usage(deep=True).sum() / (1024 * 1024)
+            print(f"Chunk {i//chunk_size + 1} loaded: {len(chunk)} rows, {memory_usage:.2f} MB")
+            
+            yield chunk, features, all_targets
+            
+        except Exception as e:
+            print(f"Error loading chunk starting at row {i}: {e}")
+            traceback.print_exc()
+            continue
 
 def follow_up_domains_pipeline(
     train_df: pd.DataFrame,
@@ -714,114 +735,280 @@ def follow_up_domains_pipeline(
     val_df: pd.DataFrame,
     feature_groups: dict,
     main_target: str,
-    domain_score_threshold: float = 0.01,
+    domain_score_threshold: float = 0.01,  # Lower threshold for correlation
     correlation_threshold: float = 0.95
 ):
     """
-    Follow-up pipeline that:
-      1) Evaluates each domain's performance with a quick model
+    Follow-up pipeline that ensures proper float32 data type conversion:
+      1) Evaluates each domain's performance using correlation metrics
       2) Filters out low-performing domains
       3) Prunes highly correlated features within the kept domains
-      4) Trains a final global model on the pruned features
-      5) Optionally trains a domain-ensemble model for comparison
+      4) Trains a final global regression model on the pruned features
 
     Args:
         train_df (pd.DataFrame): Training data (features + target).
         val_df   (pd.DataFrame): Validation data (features + target).
         feature_groups (dict): { 'domain_0': [feat1, feat2, ...], ... }
         main_target (str): Name of the target column in train_df/val_df.
-        domain_score_threshold (float): Minimum AUC threshold to keep a domain.
+        domain_score_threshold (float): Minimum correlation threshold to keep a domain.
         correlation_threshold (float): Threshold for feature correlation pruning.
 
     Returns:
-        dict: Contains domain_scores, kept_domains, final_model_score,
-              ensemble_score (if used), pruned_features, etc.
+        dict: Contains domain_scores, kept_domains, final_model_score, pruned_features, etc.
     """
+    print("Starting follow-up domains pipeline with float32 data type enforcement...")
+    
+    # -------------------------------------------------
+    # 0. Ensure data types are float32
+    # -------------------------------------------------
+    print("Converting features to float32...")
+    all_features = []
+    for feats in feature_groups.values():
+        all_features.extend(feats)
+    all_features = list(set(all_features))  # Remove duplicates
+    
+    # Convert features to float32 in both datasets
+    for feature in all_features:
+        if feature in train_df.columns:
+            train_df[feature] = train_df[feature].astype(np.float32)
+        if feature in val_df.columns:
+            val_df[feature] = val_df[feature].astype(np.float32)
+    
+    # Convert target to float32
+    if main_target in train_df.columns:
+        train_df[main_target] = train_df[main_target].astype(np.float32)
+    if main_target in val_df.columns:
+        val_df[main_target] = val_df[main_target].astype(np.float32)
+    
+    memory_usage_train = train_df.memory_usage(deep=True).sum() / (1024 * 1024)
+    memory_usage_val = val_df.memory_usage(deep=True).sum() / (1024 * 1024)
+    print(f"Memory usage - Train: {memory_usage_train:.2f} MB, Val: {memory_usage_val:.2f} MB")
 
     # -------------------------------------------------
-    # 1. Evaluate domain performance
+    # 1. Evaluate domain performance using correlation
     # -------------------------------------------------
     print("Evaluating domain performance...")
     domain_scores = {}
     for domain_name, feats in feature_groups.items():
-        score = evaluate_domain_performance(train_df, val_df, feats, main_target)
-        domain_scores[domain_name] = score
+        # Handle empty or tiny feature groups
+        if len(feats) < 5:
+            print(f"  {domain_name}: Too few features ({len(feats)}), skipping")
+            domain_scores[domain_name] = 0.0
+            continue
+            
+        # Calculate mean absolute correlation with target
+        try:
+            # Ensure features exist in train_df
+            valid_feats = [f for f in feats if f in train_df.columns]
+            if len(valid_feats) < 5:
+                print(f"  {domain_name}: Too few valid features ({len(valid_feats)}), skipping")
+                domain_scores[domain_name] = 0.0
+                continue
+                
+            # Calculate in chunks to avoid memory issues with large datasets
+            if len(train_df) > 50000:
+                print(f"  Large dataset detected, calculating correlation in chunks for {domain_name}...")
+                correlations = []
+                chunk_size = 10000
+                for i in range(0, len(train_df), chunk_size):
+                    chunk = train_df.iloc[i:i+chunk_size]
+                    chunk_corr = chunk[valid_feats].corrwith(chunk[main_target]).abs()
+                    correlations.append(chunk_corr)
+                # Average correlations across chunks
+                mean_corr = pd.concat(correlations, axis=1).mean(axis=1).mean()
+            else:
+                correlations = train_df[valid_feats].corrwith(train_df[main_target]).abs()
+                mean_corr = correlations.mean()
+                
+            domain_scores[domain_name] = float(mean_corr)
+            print(f"  {domain_name}: {mean_corr:.4f} (from {len(valid_feats)} features)")
+        except Exception as e:
+            print(f"  Error evaluating {domain_name}: {e}")
+            domain_scores[domain_name] = 0.0
     
-    print("Domain performance scores:")
-    for d, s in domain_scores.items():
+    print("Domain performance scores (correlation with target):")
+    for d, s in sorted(domain_scores.items(), key=lambda x: x[1], reverse=True):
         print(f"  {d}: {s:.4f}")
 
     # -------------------------------------------------
     # 2. Filter out low-performing domains
     # -------------------------------------------------
-    print(f"\nFiltering domains with AUC >= {domain_score_threshold}...")
+    print(f"\nFiltering domains with correlation >= {domain_score_threshold}...")
     kept_domains = [d for d, s in domain_scores.items() if s >= domain_score_threshold]
-    print("Kept domains:", kept_domains)
-
+    print(f"Kept domains: {len(kept_domains)}/{len(domain_scores)}")
+    
+    # Handle the case where no domains meet the threshold
+    if not kept_domains:
+        print("Warning: No domains met threshold. Keeping top 3 domains instead.")
+        kept_domains = sorted(domain_scores.keys(), key=lambda d: domain_scores[d], reverse=True)[:3]
+        
     # Gather all features from kept domains
     kept_features = []
     for d in kept_domains:
         kept_features.extend(feature_groups[d])
-    kept_features = list(set(kept_features))  # unique
+    kept_features = list(set(kept_features))  # Remove duplicates
+    
+    # Ensure features exist in both train and val datasets
+    valid_features = [f for f in kept_features if f in train_df.columns and f in val_df.columns]
+    print(f"Total features from kept domains: {len(valid_features)}/{len(kept_features)} valid features")
+    kept_features = valid_features
 
     # -------------------------------------------------
     # 3. Correlation pruning within kept features
     # -------------------------------------------------
     print(f"\nPruning correlated features (threshold={correlation_threshold})...")
-    # Fit the selector on training data's kept features
-    selector = SmartCorrelatedSelection(threshold=correlation_threshold, variables=kept_features)
-    train_pruned = selector.fit_transform(train_df)
-    pruned_features = train_pruned.columns.drop(main_target).tolist()
-
-    # Match columns for validation
-    val_pruned = val_df[pruned_features]
-
-    print(f"Reduced from {len(kept_features)} kept features to {len(pruned_features)} after pruning")
+    try:
+        # Handle large datasets by using a correlation-based feature selection approach
+        if len(train_df) > 50000 or len(kept_features) > 500:
+            print("Large dataset detected, using memory-efficient correlation pruning...")
+            # Use a more memory-efficient approach for large datasets
+            pruned_features = []
+            remaining_features = kept_features.copy()
+            
+            # Calculate correlation with target for sorting
+            target_corrs = {}
+            for f in remaining_features:
+                # Calculate in smaller chunks if needed
+                if len(train_df) > 50000:
+                    corrs = []
+                    chunk_size = 10000
+                    for i in range(0, len(train_df), chunk_size):
+                        chunk = train_df.iloc[i:i+chunk_size]
+                        chunk_corr = abs(np.corrcoef(chunk[f].fillna(0).astype(np.float32), 
+                                                   chunk[main_target].fillna(0).astype(np.float32))[0, 1])
+                        corrs.append(chunk_corr)
+                    target_corrs[f] = np.mean(corrs)
+                else:
+                    target_corrs[f] = abs(np.corrcoef(train_df[f].fillna(0).astype(np.float32), 
+                                                    train_df[main_target].fillna(0).astype(np.float32))[0, 1])
+            
+            # Sort features by correlation with target (descending)
+            sorted_features = sorted(target_corrs.keys(), key=lambda x: target_corrs[x], reverse=True)
+            
+            # Greedy feature selection
+            while sorted_features:
+                # Add the most correlated feature to the pruned list
+                current_feature = sorted_features.pop(0)
+                pruned_features.append(current_feature)
+                
+                # Remove highly correlated features
+                features_to_remove = []
+                for other_feature in sorted_features:
+                    # Calculate correlation in chunks if dataset is large
+                    if len(train_df) > 50000:
+                        corrs = []
+                        chunk_size = 10000
+                        for i in range(0, len(train_df), chunk_size):
+                            chunk = train_df.iloc[i:i+chunk_size]
+                            chunk_corr = abs(np.corrcoef(chunk[current_feature].fillna(0).astype(np.float32), 
+                                                       chunk[other_feature].fillna(0).astype(np.float32))[0, 1])
+                            corrs.append(chunk_corr)
+                        corr = np.mean(corrs)
+                    else:
+                        corr = abs(np.corrcoef(train_df[current_feature].fillna(0).astype(np.float32), 
+                                             train_df[other_feature].fillna(0).astype(np.float32))[0, 1])
+                    
+                    if corr > correlation_threshold:
+                        features_to_remove.append(other_feature)
+                
+                # Remove features and update sorted list
+                for f in features_to_remove:
+                    if f in sorted_features:
+                        sorted_features.remove(f)
+        else:
+            # Use the original SmartCorrelatedSelection for smaller datasets
+            # Fit the selector on training data's kept features
+            selector = SmartCorrelatedSelection(
+                threshold=correlation_threshold, 
+                variables=kept_features,
+                method='pearson'
+            )
+            # Only pass the required columns to avoid errors
+            columns_to_use = kept_features + [main_target]
+            train_subset = train_df[columns_to_use].copy()
+            
+            # Apply selection
+            selector.fit(train_subset)
+            
+            # Get features to drop and keep
+            features_to_drop = selector.features_to_drop_
+            pruned_features = [f for f in kept_features if f not in features_to_drop]
+        
+        print(f"Reduced from {len(kept_features)} to {len(pruned_features)} features after pruning")
+    except Exception as e:
+        print(f"Error in correlation pruning: {e}")
+        print("Falling back to original features")
+        pruned_features = kept_features
 
     # -------------------------------------------------
-    # 4. Train a final global model on pruned features
+    # 4. Train a final global regression model on pruned features
     # -------------------------------------------------
-    print("\nTraining final global model with pruned features...")
-    final_model = LGBMClassifier(random_state=42)
-    final_model.fit(train_pruned[pruned_features], train_pruned[main_target])
-    preds_final = final_model.predict_proba(val_pruned)[:, 1]
-    final_model_score = roc_auc_score(val_df[main_target], preds_final)
-    print(f"Final global model AUC: {final_model_score:.4f}")
+    print("\nTraining final global regression model with pruned features...")
+    try:
+        # Check if pruned features exist in both datasets
+        valid_features = [f for f in pruned_features if f in train_df.columns and f in val_df.columns]
+        if len(valid_features) < len(pruned_features):
+            print(f"Warning: {len(pruned_features) - len(valid_features)} features not found in both datasets")
+            pruned_features = valid_features
+            
+        if len(pruned_features) == 0:
+            raise ValueError("No valid features remaining after pruning")
+            
+        # Train the model with optimized parameters for Numerai
+        final_model = LGBMRegressor(
+            n_estimators=300,
+            learning_rate=0.01,
+            max_depth=6,
+            num_leaves=31,
+            colsample_bytree=0.7,
+            subsample=0.7,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            random_state=42
+        )
+        
+        # Prepare training data ensuring float32 type
+        X_train = train_df[pruned_features].fillna(0).astype(np.float32)
+        y_train = train_df[main_target].fillna(0).astype(np.float32)
+        
+        # Train model
+        final_model.fit(
+            X_train, 
+            y_train,
+            eval_metric='rmse'
+        )
+        
+        # Generate predictions and calculate correlation
+        X_val = val_df[pruned_features].fillna(0).astype(np.float32)
+        y_val = val_df[main_target].fillna(0).astype(np.float32)
+        
+        val_preds = final_model.predict(X_val)
+        final_score = np.corrcoef(y_val.values, val_preds)[0, 1]
+        print(f"Final model correlation score: {final_score:.4f}")
+        
+        # Calculate feature importance
+        feature_importance = pd.DataFrame({
+            'feature': pruned_features,
+            'importance': final_model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+    except Exception as e:
+        print(f"Error in final model training: {e}")
+        print("Returning partial results without final model")
+        final_score = 0.0
+        feature_importance = pd.DataFrame({'feature': pruned_features, 'importance': 0.0})
 
     # -------------------------------------------------
-    # 5. (Optional) Train a domain-ensemble model for comparison
-    # -------------------------------------------------
-    print("\nTraining domain-ensemble models (only for kept domains)...")
-    domain_models = {}
-    for d in kept_domains:
-        feats = list(set(feature_groups[d]).intersection(set(pruned_features)))
-        clf = LGBMClassifier(random_state=42)
-        clf.fit(train_pruned[feats], train_pruned[main_target])
-        domain_models[d] = clf
-
-    # Ensemble predictions (simple average)
-    print("Averaging predictions from kept domains...")
-    ensemble_preds = np.zeros(len(val_pruned))
-    for d in kept_domains:
-        feats = list(set(feature_groups[d]).intersection(set(pruned_features)))
-        ensemble_preds += domain_models[d].predict_proba(val_pruned[feats])[:, 1]
-    ensemble_preds /= len(kept_domains)
-
-    ensemble_score = roc_auc_score(val_df[main_target], ensemble_preds)
-    print(f"Domain-ensemble AUC: {ensemble_score:.4f}")
-
-    # -------------------------------------------------
-    # 6. Return summary results
+    # 5. Return results
     # -------------------------------------------------
     results = {
         'domain_scores': domain_scores,
         'kept_domains': kept_domains,
         'pruned_features': pruned_features,
-        'final_model_score': final_model_score,
-        'ensemble_score': ensemble_score
+        'final_model_score': final_score,
+        'feature_importance': feature_importance.head(20) if len(feature_importance) > 0 else None
     }
     return results
-
 
 def extract_feature_domains_only(train_df, features, n_clusters=10,
                                  random_seed=42, save_path='feature_domains_data.csv'):
