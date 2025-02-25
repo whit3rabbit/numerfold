@@ -12,6 +12,7 @@ import joblib
 from numeraifold.data.loading import load_data
 from numeraifold.domains.models import make_predictions_pipeline
 from numeraifold.pipeline.execution import run_domains_only_pipeline, follow_up_domains_pipeline
+from numeraifold.utils.seed import set_seed
 
 # Optional: Import numerai-tools for scoring if available
 try:
@@ -21,6 +22,12 @@ try:
 except ImportError:
     NUMERAI_TOOLS_AVAILABLE = False
     print("numerai-tools not available. Will use basic scoring methods.")
+
+
+# Set seed and check CUDA
+RANDOM_SEED = 42
+set_seed(RANDOM_SEED)
+print(f"CUDA available: {torch.cuda.is_available()}")
 
 def log_memory_usage(label="Current memory usage"):
     """Log the current memory usage of the process."""
@@ -244,7 +251,7 @@ def make_predictions_pipeline(new_data, target_col=None, models_dir='domain_mode
     # Make predictions
     results = predict_with_domain_models(new_data, domain_models, target_col)
     
-    # Create output DataFrame
+    # Create output DataFrame - keep the original index
     output_df = pd.DataFrame(index=new_data.index)
     
     # Add individual domain predictions
@@ -264,12 +271,23 @@ def make_predictions_pipeline(new_data, target_col=None, models_dir='domain_mode
     elif 'best_domain' in results and results['best_domain'] is not None:
         output_df['prediction_best'] = results['domain_predictions'][results['best_domain']]
     
-    # Add target for reference if available
+    # Copy important columns from the input data
+    # This is key - we need to preserve era and other metadata columns
+    important_cols = ['era'] if 'era' in new_data.columns else []
     if target_col is not None and target_col in new_data.columns:
-        output_df[target_col] = new_data[target_col]
+        important_cols.append(target_col)
     
-    # Add metadata
+    # Add any ID columns
+    if 'id' in new_data.columns:
+        important_cols.append('id')
+    
+    # Copy these columns to the output DataFrame
+    for col in important_cols:
+        output_df[col] = new_data[col]
+    
+    # Log available columns for debugging
     print(f"Created prediction DataFrame with {len(output_df.columns)} columns")
+    print(f"Columns: {list(output_df.columns)}")
     
     return output_df
 
@@ -351,41 +369,92 @@ def score_predictions_with_numerai_tools(predictions_df, target_col='target', er
         return None
     
     try:
+        # First, check if the era column exists in the DataFrame
+        if era_col not in predictions_df.columns:
+            print(f"Error: '{era_col}' column not found in predictions DataFrame")
+            print(f"Available columns: {list(predictions_df.columns)}")
+            return None
+            
+        # Check if target_col exists
+        if target_col not in predictions_df.columns:
+            print(f"Error: '{target_col}' column not found in predictions DataFrame")
+            print(f"Available columns: {list(predictions_df.columns)}")
+            return None
+            
         results = {}
         
         # Get prediction columns (those starting with 'pred_' or 'prediction_')
         pred_cols = [col for col in predictions_df.columns if col.startswith('pred_') or col.startswith('prediction_')]
         
-        for pred_col in pred_cols:
-            # Calculate correlation contribution
+        if not pred_cols:
+            print("No prediction columns found in DataFrame")
+            return None
+            
+        # Create a DataFrame with just the prediction columns for correlation_contribution
+        # THE FIX: correlation_contribution expects a DataFrame for predictions
+        # not numpy arrays or a single Series
+        preds_df = predictions_df[pred_cols]
+        
+        # Get meta-model (use first prediction column as meta-model)
+        # THE FIX: correlation_contribution expects a pandas Series for meta_model
+        # not a numpy array
+        meta_model = predictions_df[pred_cols[0]]
+        
+        # Get targets
+        # THE FIX: correlation_contribution expects a pandas Series for live_targets
+        # not a numpy array
+        targets = predictions_df[target_col]
+        
+        # Calculate correlation contribution
+        try:
+            # THE FIX: This is the key part that fixes the error in the traceback
+            # We pass pandas objects (DataFrame, Series, Series) instead of numpy arrays
+            # The error occurred because numpy arrays don't have a .dropna() method
+            # which is called by filter_sort_index() inside correlation_contribution()
             cc = correlation_contribution(
-                predictions_df[pred_col].values,
-                predictions_df[target_col].values,
-                predictions_df[era_col].values
+                preds_df,  # Pass DataFrame of predictions (not .values)
+                meta_model,  # Pass meta-model Series (not .values)
+                targets  # Pass targets Series (not .values)
             )
             
-            # Get mean correlation
-            corr_mean = cc['corr_mean']
+            # Process results for each prediction column
+            for pred_col in pred_cols:
+                # Get correlation by era
+                # Calculate per-era correlation (requires at least 5 data points per era)
+                pred_by_era = predictions_df.groupby(era_col).apply(
+                    lambda x: x[pred_col].corr(x[target_col]) if len(x) > 5 else np.nan
+                ).dropna()
+                
+                # Calculate metrics
+                corr_mean = pred_by_era.mean()
+                corr_std = pred_by_era.std()
+                sharpe = corr_mean / corr_std if corr_std > 0 else 0
+                
+                # Store metrics
+                results[pred_col] = {
+                    'mean_correlation': corr_mean,
+                    'std_correlation': corr_std,
+                    'sharpe_ratio': sharpe,
+                    'feature_exposure': cc.get(pred_col, 0),
+                    'correlation_by_era': pred_by_era.to_dict()
+                }
             
-            # Calculate Sharpe ratio
-            corr_std = cc['corr_std']
-            sharpe = corr_mean / corr_std if corr_std > 0 else 0
+            print("Scoring with numerai-tools completed")
+            return results
             
-            # Store metrics
-            results[pred_col] = {
-                'mean_correlation': corr_mean,
-                'sharpe_ratio': sharpe,
-                'max_drawdown': cc.get('max_drawdown', None),
-                'feature_exposure': cc.get('feature_exposure', None),
-                'correlation_by_era': cc.get('correlation_by_era', {})
-            }
-        
-        print("Scoring with numerai-tools completed")
-        return results
-    
+        except Exception as inner_e:
+            # Catch errors specifically in the correlation_contribution calculation
+            print(f"Error in correlation_contribution calculation: {inner_e}")
+            traceback.print_exc()
+            raise inner_e
+            
     except Exception as e:
+        # This catches the error shown in the traceback and prints it
         print(f"Error in scoring with numerai-tools: {e}")
         traceback.print_exc()
+        
+        # Fallback to basic correlation scoring
+        print("Falling back to basic correlation scoring...")
         return None
 
 def run_integrated_pipeline(data_version="v5.0", 
@@ -581,21 +650,29 @@ def score_models_with_validation(models_dir='domain_models', data_version="v5.0"
     Returns:
         dict: Scoring results
     """
-    print("Loading validation data for model scoring...")
+    print("\n=== Scoring Models with Validation Data ===")
     
     # Load validation data
-    _, val_df, _, _ = load_data(
+    train_df, val_df, _, _ = load_data(
         data_version=data_version,
         feature_set=feature_set,
         main_target="target",
         num_aux_targets=3,
-        sample_size=sample_size,
+        sample_size=sample_size * 2,  # Use more data for validation
         random_seed=42
     )
     
     if val_df is None:
         print("Failed to load validation data")
         return None
+    
+    # Verify 'era' column exists
+    if 'era' not in val_df.columns:
+        print("Warning: 'era' column not found in validation data")
+        print(f"Available columns: {list(val_df.columns)}")
+        print("Adding dummy 'era' column for compatibility")
+        # Add a dummy era column if needed (e.g., all rows in one era)
+        val_df['era'] = 1
     
     # Make predictions
     predictions = make_predictions_pipeline(
@@ -608,37 +685,90 @@ def score_models_with_validation(models_dir='domain_models', data_version="v5.0"
         print("Failed to generate predictions")
         return None
     
+    # Verify columns in predictions DataFrame
+    print(f"Prediction columns: {list(predictions.columns)}")
+    
+    # Ensure target column is present
+    if 'target' not in predictions.columns and 'target' in val_df.columns:
+        print("Adding target column to predictions DataFrame")
+        predictions['target'] = val_df['target']
+    
+    # Make sure era column is present for proper scoring
+    if 'era' not in predictions.columns:
+        print("Warning: 'era' column missing from predictions, adding from validation data")
+        if 'era' in val_df.columns:
+            predictions['era'] = val_df['era']
+        else:
+            print("Creating a dummy 'era' column (all rows in one era)")
+            predictions['era'] = 1
+    
     # Score with numerai-tools if available
     if NUMERAI_TOOLS_AVAILABLE:
         print("Scoring with numerai-tools...")
-        scoring_results = score_predictions_with_numerai_tools(
-            predictions_df=predictions,
-            target_col="target",
-            era_col="era"
-        )
-        
-        if scoring_results:
-            # Save results to JSON
-            scores_path = os.path.join(models_dir, 'validation_scores.json')
-            with open(scores_path, 'w') as f:
-                # Convert numpy types to Python native types for JSON
-                json_results = {}
-                for key, value in scoring_results.items():
-                    json_results[key] = {k: float(v) if isinstance(v, (np.float32, np.float64)) else v 
-                                          for k, v in value.items() if k != 'correlation_by_era'}
+        try:
+            # Check that we have both the target and era columns
+            if 'target' not in predictions.columns:
+                print("Error: 'target' column not found in predictions DataFrame")
+                raise ValueError("Missing target column")
                 
-                json.dump(json_results, f, indent=4)
+            if 'era' not in predictions.columns:
+                print("Error: 'era' column not found in predictions DataFrame")
+                raise ValueError("Missing era column")
             
-            print(f"Saved validation scores to {scores_path}")
-            return scoring_results
+            # Get prediction columns
+            pred_cols = [col for col in predictions.columns 
+                        if col.startswith('pred_') or col.startswith('prediction_')]
+            
+            if not pred_cols:
+                print("Error: No prediction columns found")
+                raise ValueError("No prediction columns")
+                
+            # Use our fixed scoring function
+            scoring_results = score_predictions_with_numerai_tools(
+                predictions_df=predictions,
+                target_col="target",
+                era_col="era"
+            )
+            
+            if scoring_results:
+                # Save results to JSON
+                scores_path = os.path.join(models_dir, 'validation_scores.json')
+                with open(scores_path, 'w') as f:
+                    # Convert numpy types to Python native types for JSON
+                    json_results = {}
+                    for key, value in scoring_results.items():
+                        # Skip correlation_by_era which can be large and may contain non-serializable types
+                        json_results[key] = {
+                            k: float(v) if isinstance(v, (np.float32, np.float64)) else v 
+                            for k, v in value.items() if k != 'correlation_by_era'
+                        }
+                    
+                    json.dump(json_results, f, indent=4)
+                
+                print(f"Saved validation scores to {scores_path}")
+                return scoring_results
+        except Exception as e:
+            print(f"Error in numerai-tools scoring: {e}")
+            traceback.print_exc()
+            print("Falling back to basic correlation scoring...")
+    else:
+        print("numerai-tools not available, using basic correlation scoring")
     
     # Basic correlation scoring as fallback
     print("Using basic correlation scoring...")
     
+    # Check if 'era' exists for grouping
+    if 'era' in predictions.columns:
+        eras = predictions['era'].unique()
+    else:
+        # Create a single era if 'era' column is missing
+        eras = [1]
+        predictions['era'] = 1
+    
     # Calculate metrics per era
     results = []
-    for era in val_df['era'].unique():
-        era_data = predictions[predictions.index.isin(val_df[val_df['era'] == era].index)]
+    for era in eras:
+        era_data = predictions[predictions['era'] == era]
         
         if len(era_data) == 0:
             continue
@@ -650,10 +780,15 @@ def score_models_with_validation(models_dir='domain_models', data_version="v5.0"
             if col.startswith('pred_') or col.startswith('prediction_'):
                 # Calculate correlation with target
                 if 'target' in era_data.columns:
-                    mask = ~np.isnan(era_data[col]) & ~np.isnan(era_data['target'])
-                    if mask.sum() >= 10:  # Need at least 10 valid pairs
-                        corr = np.corrcoef(era_data[col][mask], era_data['target'][mask])[0, 1]
-                        era_result[f"{col}_corr"] = corr
+                    # Use pandas correlation method to avoid potential issues with np.corrcoef
+                    try:
+                        # Remove NaN values
+                        valid_mask = ~np.isnan(era_data[col]) & ~np.isnan(era_data['target'])
+                        if valid_mask.sum() >= 10:  # Need at least 10 valid pairs
+                            corr = era_data[col][valid_mask].corr(era_data['target'][valid_mask])
+                            era_result[f"{col}_corr"] = corr
+                    except Exception as calc_err:
+                        print(f"Error calculating correlation for {col} in era {era}: {calc_err}")
         
         results.append(era_result)
     
@@ -666,15 +801,20 @@ def score_models_with_validation(models_dir='domain_models', data_version="v5.0"
     
     for col in prediction_cols:
         model_name = col.replace('_corr', '')
-        summary[model_name] = {
-            'mean_correlation': results_df[col].mean(),
-            'median_correlation': results_df[col].median(),
-            'std_correlation': results_df[col].std(),
-            'min_correlation': results_df[col].min(),
-            'max_correlation': results_df[col].max(),
-            'sharpe': results_df[col].mean() / results_df[col].std() if results_df[col].std() > 0 else 0,
-            'positive_eras': (results_df[col] > 0).mean() * 100  # Percentage of positive eras
-        }
+        # Handle empty or all-NaN columns
+        if col in results_df.columns and not results_df[col].isna().all():
+            mean_corr = results_df[col].mean()
+            std_corr = results_df[col].std()
+            
+            summary[model_name] = {
+                'mean_correlation': mean_corr,
+                'median_correlation': results_df[col].median(),
+                'std_correlation': std_corr,
+                'min_correlation': results_df[col].min(),
+                'max_correlation': results_df[col].max(),
+                'sharpe_ratio': mean_corr / std_corr if std_corr > 0 else 0,
+                'positive_eras': (results_df[col] > 0).mean() * 100  # Percentage of positive eras
+            }
     
     # Save summary to file
     summary_df = pd.DataFrame.from_dict(summary, orient='index')
@@ -682,6 +822,15 @@ def score_models_with_validation(models_dir='domain_models', data_version="v5.0"
     
     # Save detailed era results
     results_df.to_csv(os.path.join(models_dir, 'backtest_by_era.csv'), index=False)
+    
+    # Print summary
+    print("\nScoring Summary:")
+    for model_name, metrics in sorted(summary.items(), 
+                                     key=lambda x: x[1]['mean_correlation'], 
+                                     reverse=True)[:5]:
+        print(f"{model_name}:")
+        print(f"  Mean Correlation: {metrics['mean_correlation']:.4f}")
+        print(f"  Sharpe Ratio: {metrics['sharpe_ratio']:.4f}")
     
     print(f"Saved basic scoring results to {models_dir}/backtest_summary.csv")
     
