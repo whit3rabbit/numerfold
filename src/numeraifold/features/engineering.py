@@ -7,7 +7,6 @@ import torch
 from sklearn.base import BaseEstimator, TransformerMixin
 from numerblox.preprocessing import GroupStatsPreProcessor
 
-from numeraifold.data.loading import process_in_batches
 from numeraifold.core.model import NumerAIFold
 
 class AlphaFoldFeatureEngineering(BaseEstimator, TransformerMixin):

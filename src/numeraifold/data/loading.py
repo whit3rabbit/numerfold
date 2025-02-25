@@ -16,7 +16,6 @@ from tqdm import tqdm
 import pyarrow.parquet as pq
 import gc
 from numerapi import NumerAPI
-
 from numeraifold.utils.logging import log_memory_usage
 
 def load_data(data_version="v5.0", feature_set="small",
